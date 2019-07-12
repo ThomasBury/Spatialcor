@@ -1,0 +1,421 @@
+---
+title: "Spatial correlation - large scale minimal examples"
+author: |
+  | Thomas Bury
+  | Human Bender
+  | DS
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    theme: cosmo
+    highlight: tango
+    number_sections: true
+    toc: true
+    df_print: paged
+---
+
+<img src="C:/Users/xtbury/Documents/Projects/Github/spatialcor/sample_pic/bender_hex.png" style="position:absolute;top:0px;right:0px;" width="175px" align="right" />
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Maps and shapefiles
+library(spdep)
+library(maps)
+library(maptools)
+library(leaflet)
+library(rgdal)
+
+# Colors
+library(viridis)
+library(RColorBrewer)
+library(scico)
+library(paletteer)
+
+# GAM
+library(mgcv)
+
+# data.table, what else ?
+library(data.table)
+
+# caret
+library(caret)
+
+# Tidyverse
+library(tidyverse)
+library(ggthemes)
+library(plotly)
+library(cowplot)
+
+# Data path
+# dir_path <- file.path("c:", "Users", "Thomas", "Belfius", "R",
+#                       "Spatial stat test")
+# setwd(dir_path)
+# Assign the number of cores
+library(parallel)
+library(doParallel)
+nbr_cores <- detectCores() - 1 # leave one core for the OS
+cl <- makeCluster(nbr_cores) 
+```
+
+
+# Introduction
+
+I provide two minimal examples to compare discrete and continuous smoothing to figure out the differences. The discrete will be performed by fitting a Beta regression using a GAM with Gaussian Markov Random Fields (GMRF) as basis. The MRF are the discrete counterpart of Gaussian processes (GP).
+
+ * The GMRF smoothing requires a mesh grid (the graph/network/lattice call it as you like) to build and estimate the response based on the Markov blanket.
+
+ * The GP smoothing takes the coordinates as input (so continuous input) to estimate the response using Gaussian processes.
+
+N.B: I don't provide here methodologically exact examples (with train-test split and cross-validation to find hyper-parameters for instance). It would involve a bit more work and more CPU time and computation power.
+
+
+
+
+# Us unemployment rate - Large scale examples
+
+
+## Continuous smoothing - unemployment rate
+
+```{r, fig.width=14}
+# Load the USmap
+unemp <- read.csv("http://datasets.flowingdata.com/unemployment09.csv",
+                  header = FALSE, stringsAsFactors = FALSE)
+names(unemp) <- c("id", "state_fips", "county_fips", "name", "year",
+                  "?", "?", "?", "rate")
+unemp$county <- tolower(gsub(" County, [A-Z]{2}", "", unemp$name))
+unemp$county <- gsub("^(.*) parish, ..$","\\1", unemp$county)
+unemp$state <- gsub("^.*([A-Z]{2}).*$", "\\1", unemp$name)
+county_df <- map_data("county", projection = "albers", parameters = c(39, 45))
+
+# Build the choropleth and the states borders
+names(county_df) <- c("long", "lat", "group", "order", "state_name", "county")
+county_df$state <- state.abb[match(county_df$state_name, tolower(state.name))]
+county_df$state_name <- NULL
+state_df <- map_data("state", projection = "albers", parameters = c(39, 45))
+choropleth <- merge(county_df, unemp, by = c("state", "county"))
+choropleth <- setDT(choropleth[order(choropleth$order), ])
+choropleth <- choropleth[, pct := rate/100]
+
+roughness_param = 300
+
+# The m argument allows to specify different types of covariance functions.
+gam_gp = gam(pct ~ s(long, lat, bs='gp', k=roughness_param, m=1), data=choropleth)
+summary(gam_gp)
+
+
+# Add the prediction to the data.frame
+choropleth = choropleth %>% 
+  mutate(fit = predict(gam_gp, type='response'))
+choropleth = setDT(choropleth)
+
+
+# The base plot
+plot_county_smoothed_GP <- ggplot(choropleth, aes(long, lat, group = group)) +
+  geom_polygon(aes(fill = fit)) +
+  geom_polygon(data = state_df, colour = "white", fill = NA, size = .5) +
+  coord_fixed() +
+  theme_minimal() +
+  ggtitle("US unempl rate by county - GP") + theme_fivethirtyeight() +
+  guides(fill = guide_colorbar(barwidth = 8, barheight = 1)) +
+  theme(axis.line = element_blank(), axis.text = element_blank(),
+        axis.ticks = element_blank(), axis.title = element_blank()) +
+  scale_fill_scico(palette = "batlow")
+
+plot_county_raw <- ggplot(choropleth, aes(long, lat, group = group)) +
+  geom_polygon(aes(fill = pct)) +
+  geom_polygon(data = state_df, colour = "white", fill = NA, size = .5) +
+  coord_fixed() +
+  theme_minimal() +
+  ggtitle("US unempl rate by county - raw") + theme_fivethirtyeight() +
+  guides(fill = guide_colorbar(barwidth = 8, barheight = 1)) +
+  theme(axis.line = element_blank(), axis.text = element_blank(),
+        axis.ticks = element_blank(), axis.title = element_blank()) +
+  scale_fill_scico(palette = "batlow")
+
+plot_grid(plot_county_raw, plot_county_smoothed_GP)
+```
+
+
+
+
+Let's perform the discrete smoothing on the same data set to picture the differences.
+
+
+## Discrete smoothing - unemployment rate
+
+
+
+```{r, fig.width=14}
+# Load the USmap
+unemp <- read.csv("http://datasets.flowingdata.com/unemployment09.csv",
+                  header = FALSE, stringsAsFactors = FALSE)
+names(unemp) <- c("id", "state_fips", "county_fips", "name", "year",
+                  "?", "?", "?", "rate")
+unemp$county <- tolower(gsub(" County, [A-Z]{2}", "", unemp$name))
+unemp$county <- gsub("^(.*) parish, ..$","\\1", unemp$county)
+unemp$state <- gsub("^.*([A-Z]{2}).*$", "\\1", unemp$name)
+county_df <- map_data("county", projection = "albers", parameters = c(39, 45))
+
+# Build the choropleth and the states borders
+names(county_df) <- c("long", "lat", "group", "order", "state_name", "county")
+county_df$state <- state.abb[match(county_df$state_name, tolower(state.name))]
+county_df$state_name <- NULL
+state_df <- map_data("state", projection = "albers", parameters = c(39, 45))
+choropleth <- merge(county_df, unemp, by = c("state", "county"))
+choropleth <- setDT(choropleth[order(choropleth$order), ])
+choropleth <- choropleth[, `:=`(pct = rate/100, GEOID = as.factor(paste0(state,  county)) )]
+
+# group by county
+county_data <- choropleth[, lapply(.SD, median), by = GEOID, .SDcols = c('long', 'lat', 'pct')]
+# Build the lattice
+xy <- cbind(county_data$long, county_data$lat)
+
+nb <- spdep::tri2nb(xy, row.names = county_data$GEOID) 
+names(nb) <- attr(nb, "region.id")
+
+# The m argument allows to specify different types of covariance functions.
+ctrl <- gam.control(nthreads = 6) # use 6 parallel threads, reduce if fewer physical CPU cores
+
+# Fitting the GAM beta regression with GMRF as basis (discrete version of GP)
+# Try to change the roughness param to see the effect
+# 
+# roughness_param == should be an integer, the lower the smoother the plot (the rank of the MRF, the lower the rank the smoother)
+#                    if you remove k-param from the below fit, the fit will be done with full rand GMRF
+#
+roughness_param = 100
+gam_mrf <- gam(pct ~ s(GEOID, bs = 'mrf', k = roughness_param, xt = list(nb = nb)), # define MRF smooth
+               data = county_data,
+               method = 'REML', 
+               family = betar,  # fit a beta regression
+               control = ctrl) 
+# Print out the summary
+summary(gam_mrf)
+
+# Add the prediction to the data.frame, just predict for the counties then join the choropleth to avoid predicting 
+# several times the same row
+county_data = county_data %>% 
+  mutate(fit = predict(gam_mrf, type='response'))
+county_data = setDT(county_data)
+county_data = county_data[, .(GEOID, fit)]
+
+# Joining prediction to the map_data df. This map_data df is just the same as the shape file but easier to plot with ggplot2
+plotdat = choropleth %>%
+  left_join(county_data, by = c('GEOID' = 'GEOID')) 
+
+# define the plot. Note that since I did the minimal example, ggplot comes natively with a new geom called 
+# "geom_sf" no need to convert data into interpretable polygons
+plot_county_smoothed_GMRF <- ggplot(plotdat, aes(long, lat, group = group)) +
+  geom_polygon(aes(fill = fit)) +
+  geom_polygon(data = state_df, colour = "white", fill = NA, size = .5) +
+  coord_fixed() +
+  theme_minimal() +
+  ggtitle("US unempl rate by county - GMRF") + theme_fivethirtyeight() +
+  guides(fill = guide_colorbar(barwidth = 8, barheight = 1)) +
+  theme(axis.line = element_blank(), axis.text = element_blank(),
+        axis.ticks = element_blank(), axis.title = element_blank()) +
+  scale_fill_scico(palette = "batlow")
+
+plot_grid(plot_county_raw, plot_county_smoothed_GMRF)
+```
+
+
+
+
+Let's compare the continuous and discrete smoothings (GP vs GMRF)
+
+```{r, fig.width=14}
+plot_grid(plot_county_smoothed_GP, plot_county_smoothed_GMRF)
+```
+
+
+
+
+
+# Us education level - Large scale examples
+
+## Discrete smoothing - education level
+
+A beautiful example here: https://www.fromthebottomoftheheap.net/2017/10/19/first-steps-with-mrf-smooths/ but takes time to run (for an unknown reason some states are missing in the provided data set but present in the example shown on the webpage).
+
+
+### Few states
+
+```{r, out.width = '90%', warning=FALSE, error=FALSE, message=FALSE}
+# Load the data, for an unknownreason the file download from the github does not report results for 
+# California and a couple of other states
+data_path = "C:/Users/xtbury/Documents/Projects/Italy projects/002_Zoning/Data files/"
+file_name = "us_county_hs_only/us_county_hs_only.shp"
+
+shp <- rgdal::readOGR(paste0(data_path, file_name))
+
+# If necessary, you can load the whole US shapefile
+# shp <- rgdal::readOGR('D:/Users/EUDZ040/R/002_Zoning/Data files/us_county_hs_only/cb_2017_us_county_500k.shp')
+
+# Let's choose some states according to the ANSI code
+states_num <- c(26,33,34,36)
+shp <- shp[shp$STATEFP %in% states_num, ]
+# Here is the mapping table code <-> name
+data_path = "C:/Users/xtbury/Documents/Projects/Italy projects/002_Zoning/Data files/"
+file_name = "us-state-ansi-fips.csv"
+path_full = paste0(data_path, file_name)
+
+states_names <- fread(path_full)
+# Data prep
+states_names$stname <- tolower(states_names$stname)
+states_names <- states_names[st %in% states_num]
+colnames(states_names) <- c('stname', 'STATEFP', 'stusps')
+
+# select the states, and convert % to proportion
+states_df <-  shp %>%   # add other FIPS codes as desired
+  as.data.frame() %>% 
+  droplevels() %>% 
+  mutate(hsd = hs_pct / 100,
+         county = stringr::str_replace(tolower(NAME), pattern='\\.', ''),
+         county = factor(county))
+nb <- spdep::poly2nb(shp, row.names = states_df$GEOID)
+names(nb) <- attr(nb, "region.id")
+ctrl <- gam.control(nthreads = 6) # use 6 parallel threads, reduce if fewer physical CPU cores
+
+# Fitting the GAM beta regression with GMRF as basis (discrete version of GP)
+# Try to change the roughness param to see the effect
+# 
+# roughness_param == should be an integer, the lower the smoother the plot (the rank of the MRF, the lower the rank the smoother)
+#                    if you remove k-param from the below fit, the fit will be done with full rand GMRF
+#
+roughness_param = 20
+gam_mrf <- gam(hsd ~ s(GEOID, bs = 'mrf', k = roughness_param, xt = list(nb = nb)), # define MRF smooth
+               data = states_df,
+               method = 'REML', 
+               family = betar,  # fit a beta regression
+               control = ctrl) 
+
+# Print out the summary
+summary(gam_mrf)
+
+# Add the prediction to the data.frame
+states_df = states_df %>% 
+  mutate(fit = predict(gam_mrf, type='response'))
+states_df = setDT(states_df)
+
+# Joining data, the data.table way
+states_names$STATEFP <- as.factor(states_names$STATEFP)
+states_df = states_names[states_df, on = 'STATEFP']
+
+# Joining prediction to the map_data df. This map_data df is just the same as the shape file but easier to plot with ggplot2
+plotdat = map_data("county", states_names$stname) %>%
+  left_join(states_df, by = c('region' = 'stname', 'subregion' = 'county')) 
+
+# We want to plot by county, so we need to group by subregion
+sub_reg_data_mich <- plotdat %>% group_by(GEOID)
+
+# define the plot. Note that since I did the minimal example, ggplot comes natively with a new geom called 
+# "geom_sf" no need to convert data into interpretable polygons
+map_p1 <- ggplot(data = sub_reg_data_mich, # the input data
+                 aes(x = long, y = lat, fill = fit, group = group)) +
+          geom_polygon() + # plot the boroughs
+          geom_path(colour="grey35", lwd=0.05) + # borough borders
+          coord_equal() + # fixed x and y scales
+          scale_fill_scico(palette = "batlow") +
+          theme_fivethirtyeight() + 
+          guides(fill = guide_colorbar(barwidth = 10, barheight = 1))
+
+
+# print out the graphic
+map_p1
+```
+
+### Almost the whole country
+
+
+```{r, out.width = '90%', warning=FALSE, error=FALSE, message=FALSE}
+# Load the data, for an unknownreason the file download from the github does not report results for 
+# California and a couple of other states
+data_path = "C:/Users/xtbury/Documents/Projects/Italy projects/002_Zoning/Data files/"
+file_name = "us_county_hs_only/us_county_hs_only.shp"
+path_full = paste0(data_path, file_name)
+
+shp <- rgdal::readOGR(path_full)
+
+# If necessary, you can load the whole US shapefile
+# shp <- rgdal::readOGR('D:/Users/EUDZ040/R/002_Zoning/Data files/us_county_hs_only/cb_2017_us_county_500k.shp')
+
+# Let's choose some states according to the ANSI code
+states_num <- c(1,4:6, 8:13, 16:42, 44:51, 53:56)
+shp <- shp[shp$STATEFP %in% states_num, ]
+# Here is the mapping table code <-> name
+data_path = "C:/Users/xtbury/Documents/Projects/Italy projects/002_Zoning/Data files/"
+file_name = "us-state-ansi-fips.csv"
+path_full = paste0(data_path, file_name)
+states_names <- fread(paste0(data_path, file_name))
+
+# Data prep
+states_names$stname <- tolower(states_names$stname)
+states_names <- states_names[st %in% states_num]
+colnames(states_names) <- c('stname', 'STATEFP', 'stusps')
+
+# select the states, and convert % to proportion
+states_df <-  shp %>%   # add other FIPS codes as desired
+  as.data.frame() %>% 
+  droplevels() %>% 
+  mutate(hsd = hs_pct / 100,
+         county = stringr::str_replace(tolower(NAME), pattern='\\.', ''),
+         county = factor(county))
+nb <- spdep::poly2nb(shp, row.names = states_df$GEOID)
+names(nb) <- attr(nb, "region.id")
+ctrl <- gam.control(nthreads = 6) # use 6 parallel threads, reduce if fewer physical CPU cores
+
+# Fitting the GAM beta regression with GMRF as basis (discrete version of GP)
+# Try to change the roughness param to see the effect
+# 
+# roughness_param == should be an integer, the lower the smoother the plot (the rank of the MRF, the lower the rank the smoother)
+#                    if you remove k-param from the below fit, the fit will be done with full rand GMRF
+#
+roughness_param = 100
+gam_mrf <- gam(hsd ~ s(GEOID, bs = 'mrf', k = roughness_param, xt = list(nb = nb)), # define MRF smooth
+               data = states_df,
+               method = 'REML', 
+               family = betar,  # fit a beta regression
+               control = ctrl) 
+# Print out the summary
+summary(gam_mrf)
+
+# Add the prediction to the data.frame
+states_df = states_df %>% 
+  mutate(fit = predict(gam_mrf, type='response'))
+states_df = setDT(states_df)
+
+# Joining data, the data.table way
+states_names$STATEFP <- as.factor(states_names$STATEFP)
+states_df = states_names[states_df, on = 'STATEFP']
+
+# Joining prediction to the map_data df. This map_data df is just the same as the shape file but easier to plot with ggplot2
+plotdat = map_data("county", states_names$stname) %>%
+  left_join(states_df, by = c('region' = 'stname', 'subregion' = 'county')) 
+
+# We want to plot by county, so we need to group by subregion
+sub_reg_data_mich <- plotdat %>% group_by(GEOID)
+
+# define the plot. Note that since I did the minimal example, ggplot comes natively with a new geom called 
+# "geom_sf" no need to convert data into interpretable polygons
+map_p2 <- ggplot(data = sub_reg_data_mich, # the input data
+                 aes(x = long, y = lat, fill = fit, group = group)) +
+          geom_polygon() + # plot the boroughs
+          geom_path(colour="grey35", lwd=0.05) + # borough borders
+          coord_equal() + # fixed x and y scales
+          scale_fill_scico(palette = "batlow") +
+          theme_fivethirtyeight() + 
+          guides(fill = guide_colorbar(barwidth = 10, barheight = 1))
+
+
+# print out the graphic
+map_p2
+```
+
+
+
+
+
+
+
+
+

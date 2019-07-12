@@ -1,0 +1,430 @@
+---
+title: "Spatial correlation - few minimal examples"
+author: |
+  | Thomas Bury
+  | Human Bender
+  | DS
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    theme: cosmo
+    highlight: tango
+    number_sections: true
+    toc: true
+    df_print: paged
+---
+
+<img src="C:/Users/xtbury/Documents/Projects/Github/spatialcor/sample_pic/bender_hex.png" style="position:absolute;top:0px;right:0px;" width="175px" align="right" />
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Maps and shapefiles
+library(spdep)
+library(maps)
+library(maptools)
+library(leaflet)
+library(rgdal)
+
+# Colors
+library(viridis)
+library(RColorBrewer)
+library(scico)
+library(paletteer)
+
+# GAM
+library(mgcv)
+
+# data.table, what else ?
+library(data.table)
+
+# caret
+library(caret)
+
+# Tidyverse
+library(tidyverse)
+library(ggthemes)
+library(plotly)
+
+# Data path
+# dir_path <- file.path("c:", "Users", "Thomas", "Belfius", "R",
+#                       "Spatial stat test")
+# setwd(dir_path)
+# Assign the number of cores
+library(parallel)
+library(doParallel)
+nbr_cores <- detectCores() - 1 # leave one core for the OS
+cl <- makeCluster(nbr_cores) 
+```
+
+
+
+
+# Forewords
+
+## Disclaimer
+
+Those minimal examples are done to illustrate the different models. I didn't follow the standard methodology. Especially, the models are fitted using the whole data set and the outcomes are compared loosely and in a visual way. However, the strengths and weaknesses can be grasped with those simple examples.
+Moreover some methods to clean the data (filter the noise) might be applied but are not described here. I think of filtering out the noise of the correlation matrix. Pretty common for temporal correlation (especially in finance and physics), those methods might be applied to the spatial correlation matrix. To be investigated. 
+
+## Maps in R
+
+One of the best tuto: https://github.com/Robinlovelace/Creating-maps-in-R and the magnificent Leaflet https://rstudio.github.io/leaflet/
+
+## Spatial modelling
+
+There are different way to model spatial dependencies. Among them, there are:
+
+ - Spatial auto-regressive model (where potentially every location has an influence on another one). A SAR model can be written as a CAR (analogies to AR and MA in time series)
+ - Conditional auto-regressive model (CAR). A more modern denomination: Gaussian Markov Random field
+ - Gaussian processes (aka kriging is geo-stat), the (space) continuous counterpart of the GMRF. Often easier to deal with
+ - Spatial error model (the error)
+ - GAM and their extensions (GAMLSS, etc.)
+ - Mixed models allow to model spatial correlation using a random effect (loosely allow to use correlated errors and clustering)
+ - Bayesian hierarchical models (not demonstrated, not an expert and requires to perform sampling "externally" using JAGS, BUGS, ...)
+
+
+# Chicago
+
+I'll provide some minimal examples. Those examples are based on http://www.econ.uiuc.edu/~lab/workshop/Spatial_in_R.html and extend to spatial modelling using GAM, Gaussian processes (GP) and Gaussian Markov Random Fields (GMRF).
+
+Those examples will be examining violent crimes and foreclosures in the City of Chicago (open data).
+
+
+## Crime data
+
+Basic plot of the polygons part of the shapefile
+
+```{r cars}
+data_path = "C:/Users/xtbury/Documents/Projects/Italy projects/002_Zoning/Data files/"
+file_name = "foreclosures.shp"
+chi.poly <- rgdal::readOGR(paste0(data_path, file_name))
+class(chi.poly)
+str(slot(chi.poly,"data"))
+summary(chi.poly@data$violent)
+# Default plot, not bad but not that beautiful
+plot(chi.poly)
+```
+
+
+
+Just because leaflet is awesome and it so much better looking than base plot:
+
+
+```{r}
+leaflet(chi.poly) %>%
+  addPolygons(stroke = FALSE, fillOpacity = 0.5, smoothFactor = 0.5) %>%
+  addTiles() #adds a map tile, the default is OpenStreetMap
+
+# qpal <- colorQuantile("inferno", chi.poly@data$violent, n=9) 
+qpal <- colorQuantile(scico(30, palette = 'roma'), chi.poly@data$violent, n=9) 
+
+leaflet(chi.poly) %>%
+  addPolygons(stroke = FALSE, fillOpacity = .8, smoothFactor = 0.2, color = ~qpal(violent)
+  ) %>%
+  addTiles()
+```
+
+
+
+# Spatial statistics
+## OLS
+
+since OLS does not allow correlated error, heteroskedasticity, etc (Gauss-Markov), It will be a bad benchmark but anyway, let's consider it as our baseline.
+
+```{r}
+chi.ols<-lm(violent~est_fcs_rt+bls_unemp, data=chi.poly@data)
+summary(chi.ols)
+```
+
+The problem with ignoring the spatial structure of the data implies that the OLS estimates in the non spatial model may be biased, inconsistent or inefficient
+
+
+## Spatial regression
+
+From the shape file we can extract the neighborhood (the lattice)
+
+```{r}
+# neighbors: all the touching nodes, other choices possible
+list.queen <- poly2nb(chi.poly, queen=TRUE) 
+# convert th neighborhood in a list
+W <- nb2listw(list.queen, style="W", zero.policy=TRUE)
+W
+```
+
+A basic plot of the neighborhood
+
+```{r}
+plot(W,coordinates(chi.poly))
+```
+
+We can even extract the coordinates for latter convenience
+
+```{r}
+coords <- coordinates(chi.poly)
+W_dist <- dnearneigh(coords,0,1,longlat = FALSE)
+```
+
+
+## Testing the spatial correlation
+
+Did we miss something by ignoring the spatial structure ? 
+
+```{r}
+# Moran test
+moran.lm <- lm.morantest(chi.ols, W, alternative="two.sided")
+print(moran.lm)
+```
+
+```{r}
+# Lagrange multiplier test
+LM <- lm.LMtests(chi.ols, W, test="all")
+print(LM)
+```
+
+The classical counterpart of time series econometric models are the spatial auto-regressive models and the conditional auto regressive models (SAR and CAR). But they are also Gaussian processes and the discrete counterpart, the Markov Random fields. The Ising model in physics and generally all physical systems described by a Gibbs measure are MRF. In machine learning, GP and MRF found many applications (part of graphical model theory). GP regression is also called kriging in geography and geo-statistics.
+A blended approach is to use GP as basis in GAM instead of splines.
+
+## Spatial autoregression
+
+```{r}
+chi.sar <- lagsarlm(violent~est_fcs_rt+bls_unemp, data=chi.poly@data, W)
+summary(chi.sar)
+```
+
+## Spatial error model
+
+```{r}
+chi.sem <- errorsarlm(violent~est_fcs_rt+bls_unemp, data=chi.poly@data, W)
+summary(chi.sem)
+```
+
+## Conditional autoregression
+
+
+```{r}
+chi.car <- spautolm(violent~est_fcs_rt+bls_unemp, data=chi.poly@data, listw = W, family = "CAR")
+summary(chi.car)
+```
+
+
+## Compare the OLS and SAR
+
+```{r}
+range01 <- function(x, na.rm = T){2*(x - min(x, na.rm = na.rm)) / (max(x, na.rm=na.rm) - min(x, na.rm=na.rm))-1}
+n_cols <- 9
+spectral_col <- colorRampPalette(brewer.pal(9,"Spectral"))(n_cols)
+
+chi.poly@data$chi.ols.res<-resid(chi.ols) #residuals ols
+chi.poly@data$chi.ols.fval <- chi.ols$fitted.values
+# spplot(chi.poly,"chi.ols.res", at=seq(min(chi.poly@data$chi.ols.res,na.rm=TRUE),
+#                                       max(chi.poly@data$chi.ols.res,na.rm=TRUE),
+#                                       length=n_cols),col.regions=spectral_col)
+
+chi.poly@data$chi.sar.res <- resid(chi.sar) #residual sar 
+chi.poly@data$chi.sar.fval <- chi.sar$fitted.values
+# spplot(chi.poly,"chi.sar.res", at=seq(min(chi.poly@data$chi.sar.res,na.rm=TRUE),
+#                                       max(chi.poly@data$chi.sar.res,na.rm=TRUE),
+#                                       length=n_cols),col.regions=spectral_col)
+
+chi.poly@data$chi.car.res<- chi.car$fit$residuals #residual sar 
+chi.poly@data$chi.car.fval <- chi.car$fit$fitted.values
+
+chi.poly@data$chi.sem.res<-resid(chi.sem) #residual sar
+chi.poly@data$chi.sem.fval <- chi.sem$fitted.values
+```
+
+
+## GAM with Gaussian process smooth
+
+```{r, message=FALSE, error=FALSE, warning=FALSE}
+df_coord <- data.table(coordinates(chi.poly))
+colnames(df_coord) <- c('lon', 'lat')
+crime_dt <- data.table(chi.poly@data)
+crime_dt <- cbind(crime_dt, df_coord)
+crime_long = melt(crime_dt, measure.vars = c("chi.ols.res", "chi.sar.res", "chi.car.res", "chi.sem.res" ))
+
+chi.poly_f <- broom::tidy(chi.poly)
+
+chi.poly$id <- row.names(chi.poly) # allocate an id variable to the sp data
+head(chi.poly@data, n = 2) # final check before join (requires shared variable name)
+chi.poly_f <- left_join(chi.poly_f, chi.poly@data) # join the data
+
+chi_gam <- gam(violent ~ s(long, lat, bs='gp', k=100, m=2) + 
+                 s(est_fcs_rt, k=5) + s(bls_unemp, k=3),
+               data=chi.poly_f)
+
+```
+
+
+
+
+## GBM with coordinates as features
+
+No optimization here (no hyperparameters tuning), just a naive application to see how it fits
+
+```{r}
+set.seed(1234)
+
+chi.poly_f <- setDT(chi.poly_f)
+data_subset <- chi.poly_f[, .(violent, long, lat, est_fcs_rt, bls_unemp)]
+
+registerDoParallel(cl)
+
+
+ctrl <- trainControl(allowParallel = TRUE)
+ml_fit <- train(violent ~ long + lat + est_fcs_rt + bls_unemp, 
+                data = data_subset, 
+                method = "gbm", 
+                trControl = ctrl, 
+                metric = "RMSE")
+
+
+
+#stopCluster(cluster)
+registerDoSEQ()
+# summary
+ml_pred <- predict(ml_fit, chi.poly_f[, !c("violent"), with = F])
+ml_res  <- ml_pred - chi.poly_f$violent
+#postResample(test_pred, my_data_test$log_am)
+```
+
+
+
+plot the residuals and results
+
+```{r, fig.width=20, fig.height=10, fig.align="center"}
+chi.poly_f <- setDT(chi.poly_f)
+chi.poly_f <- chi.poly_f[, chi.gam.res := chi_gam$residuals]
+chi.poly_f <- chi.poly_f[, chi.gam.fval := chi_gam$fitted.values]
+chi.poly_f <- chi.poly_f[, chi.ml.fval := ml_pred]
+chi.poly_f <- chi.poly_f[, chi.ml.res := ml_res]
+
+chi.poly_f_long <- setDT(melt(chi.poly_f, measure.vars = 
+                      c("chi.ols.res", "chi.sar.res", "chi.car.res", "chi.sem.res", "chi.gam.res","chi.ml.res",
+                        "chi.ols.fval", "chi.sar.fval","chi.car.fval", "chi.sem.fval", "chi.gam.fval","chi.ml.fval" )))
+
+chi.poly_f_long <- chi.poly_f_long[, scaled_res := scale(value), by = .(variable)]
+
+qcut = function(x, n) {
+  quantiles = seq(0, 1, length.out = n+1)
+  cutpoints = unname(quantile(x, quantiles, na.rm = TRUE))
+  cut(x, cutpoints, include.lowest = TRUE)
+}
+
+chi.poly_f_long <- chi.poly_f_long[, res_quant := qcut(value, 10)]
+
+
+map_p <- ggplot(data = chi.poly_f_long, # the input data
+           aes(x = long, y = lat, fill = value, group = group)) + # define variables
+              geom_polygon() + # plot the boroughs
+              geom_path(colour="black", lwd=0.05) + # borough borders
+              coord_equal() + # fixed x and y scales
+              facet_wrap(~ variable, ncol = 6) + # one plot per time slice
+              scale_fill_paletteer_c("pals", "ocean.curl", direction = 1, limits = c(-1, 1) * max(abs(chi.poly_f_long$value))) +
+              #scale_fill_distiller(palette = "RdBu") + # legend options
+              theme(axis.text = element_blank(), # change the theme options
+                    axis.title = element_blank(), # remove axis titles
+                    axis.ticks = element_blank()) # remove axis ticks
+
+
+map_p
+```
+
+## Are the models good?
+
+```{r echo=FALSE, fig.height=3}
+par(mfrow=c(1,3))
+
+hist(chi.poly@data$violent)
+qqnorm(chi.poly@data$chi.car.res, main = "CAR Residuals");qqline(chi.poly@data$chi.car.res)
+plot(chi.poly@data$chi.car.res, chi.poly@data$chi.sar.res, main="CAR vs SAR Residuals")
+```
+
+Yep they're bad...
+
+```{r echo=FALSE, fig.height=3}
+par(mfrow=c(1,3))
+
+qqnorm(chi.poly@data$chi.sem.res, main = "SEM Residuals");qqline(chi.poly@data$chi.sem.res)
+qqnorm(chi.poly_f$chi.gam.res, main = "GAM Residuals");qqline(chi.poly_f$chi.gam.res)
+qqnorm(chi.poly_f$chi.ml.res, main = "GBM Residuals");qqline(chi.poly_f$chi.ml.res)
+```
+
+Not "good" but look at the residuals scale, a bit better from left to right.
+
+
+
+
+
+## Gaussian Random Markov Fields
+
+If we really need a discrete version of the Gaussian Processes, then we should fit a GMRF.
+I'll use another minimal example here because GMRF are much more computational extensive (laptop restriction).
+
+
+```{r}
+data_path = "C:/Users/xtbury/Documents/Projects/Italy projects/002_Zoning/Data files/"
+file_name = "us_county_hs_only/us_county_hs_only.shp"
+shp <- rgdal::readOGR(paste0(data_path, file_name))
+## select michigan, and convert % to proportion
+mich_df <- shp[shp$STATEFP %in% c(26), ] %>%   # add other FIPS codes as desired
+  as.data.frame() %>% 
+  droplevels() %>% 
+  mutate(hsd = hs_pct / 100,
+         county = stringr::str_replace(tolower(NAME), pattern='\\.', ''),
+         county = factor(county))
+nb <- spdep::poly2nb(shp[shp$STATEFP %in% c(26), ], row.names = mich_df$county)
+names(nb) <- attr(nb, "region.id")
+ctrl <- gam.control(nthreads = 6) # use 6 parallel threads, reduce if fewer physical CPU cores
+
+gam_mrf <- gam(hsd ~ s(county, bs = 'mrf', xt = list(nb = nb)), # define MRF smooth
+               data = mich_df,
+               method = 'REML', 
+               family = betar,  # fit a beta regression
+               control = ctrl) 
+summary(gam_mrf)
+
+mich_df = mich_df %>% 
+  mutate(fit = predict(gam_mrf, type='response'))
+
+plotdat = map_data("county", 'michigan') %>%
+  left_join(mich_df, by = c('subregion' = 'county')) %>% 
+  mutate(fillcol = cut(fit, breaks=seq(.25, .45, by = .025)))
+
+# p = plotdat %>% 
+#   group_by(subregion) %>%
+#   plot_ly(x = ~long, y = ~lat, 
+#           color = ~fillcol, 
+#           colors = viridis::plasma(50, begin=1, end=0),
+#           text = ~subregion, hoverinfo = 'text') %>%
+#   add_polygons(line = list(width = 0.4)) %>%
+#   layout(title = "% with Maximum of HS Education in Michigan")
+
+sub_reg_data <- plotdat %>% group_by(subregion)
+
+map_p2 <- ggplot(data = sub_reg_data, # the input data
+                aes(x = long, y = lat, fill = fillcol, group = group)) + # define variables
+  geom_polygon() + # plot the boroughs
+  geom_path(colour="black", lwd=0.05) + # borough borders
+  coord_equal() + # fixed x and y scales
+  scale_fill_scico_d(palette = "batlow")+ # batlow is the scientific version of the rainbow colour map
+  theme_fivethirtyeight()
+  #scale_fill_brewer(palette = "RdBu") + # legend options
+  # theme(axis.text = element_blank(), # change the theme options
+  #       axis.title = element_blank(), # remove axis titles
+  #       axis.ticks = element_blank()) # remove axis ticks
+
+
+map_p2
+```
+
+
+
+A beautiful example here: https://www.fromthebottomoftheheap.net/2017/10/19/first-steps-with-mrf-smooths/ 
+The GMRF has the advantage to be smooth, the GBM pred may seems better but can be rather rough.
+
+
+
+
+
+
