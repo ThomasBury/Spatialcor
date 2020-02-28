@@ -1,0 +1,1782 @@
+---
+title: "Spatial correlation - GMRF smoothing of the Allsecur-GPC residuals"
+author: |
+  | Thomas Bury
+  | Data Office - Advanced Analytics
+  | Allianz
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    theme: cosmo
+    highlight: tango
+    number_sections: true
+    toc: true
+    df_print: paged
+---
+
+<img src="D:/Users/EUDZ040/R/002_Zoning/notebook/allianz_logo.jpg" style="position:absolute;top:0px;right:0px;" width="175px" align="right" />
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+# Maps and shapefiles
+library(spdep)
+library(maps)
+library(maptools)
+library(leaflet)
+library(rgdal)
+library(sf)
+library(rmapshaper)
+
+
+# Colors
+library(viridis)
+library(RColorBrewer)
+library(scico)
+
+# GAM
+library(mgcv)
+
+# data.table, what else ?
+library(data.table)
+
+# Rendering
+library(pander)
+
+# caret
+library(caret)
+
+# Tidyverse
+library(tidyverse)
+library(haven)
+library(ggthemes)
+library(plotly)
+library(cowplot)
+library(scales)
+library(pals)
+
+# Data path
+# dir_path <- file.path("c:", "Users", "Thomas", "Belfius", "R",
+#                       "Spatial stat test")
+# setwd(dir_path)
+# Assign the number of cores
+library(parallel)
+library(doParallel)
+nbr_cores <- detectCores() - 1 # leave one core for the OS
+cl <- makeCluster(nbr_cores) 
+```
+
+
+# Introduction
+
+I provide two minimal examples to compare discrete and continuous smoothing to figure out the differences. The discrete will be performed by fitting a Beta regression using a GAM with Gaussian Markov Random Fields (GMRF) as basis. The MRF are the discrete counterpart of Gaussian processes (GP).
+
+ * The GMRF smoothing requires a mesh grid (the graph/network/lattice call it as you like) to build and estimate the response based on the Markov blanket.
+
+ * The GP smoothing takes the coordinates as input (so continuous input) to estimate the response using Gaussian processes.
+
+The residuals are the geomtric ones: $\mathrm{res} = \mathrm{freq}_{\mathrm{obs}}/\mathrm{freq}_{\mathrm{glm}}$ meaning that we really consider the Poisson distribution as valid. If $\mathrm{res} <1$ the model overestimates the claim frequency and vice versa. 
+
+Summarizing what I've done in this notebook:
+
+ - Compute the geometrical (ratio) and the arithmetic (difference) residuals. If you change from exponential/multiplicative models to additives ones you'll just have to change from geometrical to arithmetic residuals
+ - Smooth the raw residuals at the PC4CODE level
+ - Plot the results using a good colour palette. Indeed Jet/rainbow colour palette has repeatedly reported as a misleading one and does not render the information that one wants to visualize (Google "why jet colour palette is bad" to know why). Sadly it's still used by many software as the defaults palette. Especially important to communicate the results to the management.
+ - Cluster the smoothed residuals using hierarchical clustering based on the Euclidean distance matrix using the Ward linkage
+ - Cut the resulting tree into 20 and 10 zones for comparison. As Alessandra pointed out, 20 zones to summarizing only 3 geo-predictors with few levels (re-binned by Allsecur in Emblem) is an overshooting (too many zones)
+ - Plot the predicted(smoothed) and raw residuals on the test set
+
+Moreover, I did the same pipeline on the PC3CODE and PC2CODE levels of coarse graining. I've done:
+ - Use the aggregated version of the raw GLM residuals since I only have the raw residuals at the PC4CODE level. So it's not 100% valid but it provides intuition of what would be the results.
+ - Merge the polygons and the shape files at those two levels
+ - Re-fit the GAM with GMRF basis
+ - Plot the results, smoothed and raw residuals on the training set
+
+The run is pretty fast, the entire file compile in +-15 min (can be re-written avoiding doing multiple times the same operation, will be then much faster). The most expensive part being the plotting chunks. The results (at least for the smoothing part) should be quite similar to the ICAR. The most discriminative part should be the clustering part since quantiles and hierarchical clustering are pretty different. The hierarchical clustering has the advantage to group similar areas (in terms of smoothed residuals) pairwise and build the structure. This means that zone 1 is more similar to zone 2 than to zone 3 (similarity order).
+
+The quantiles will provide an uniform distribution among zones but two areas within a single zone might therefore be significantly different.
+
+
+# Discrete and continuous spatial smoothing at PC4CODE level
+
+## Discrete smoothing: GAM with GMRF basis smoothing 
+
+
+
+```{r}
+res_dt = setDT(read_sas('D:/Users/EUDZ040/R/005_zoning_allsecur/Alessandra_files/db_postbs_precl.sas7bdat'))
+res_dt = res_dt[, .(Exposure, freq_all, ncl_tpl_MD, PC4CODE, sample2)][, glm_ncl := freq_all*Exposure]
+
+# Rename pedestrian way but more readable
+old_names = c("freq_all", "ncl_tpl_MD")
+new_names = c("glm_freq", "ncl_tpl")
+setnames(res_dt, old = old_names, new = new_names)
+res_dt = res_dt[, .(Exposure, ncl_tpl, PC4CODE, sample2, glm_ncl)]
+res_dt = res_dt[, .(Exposure = sum(Exposure), ncl_tpl = sum(ncl_tpl), glm_ncl = sum(glm_ncl)  ), by = .(PC4CODE, sample2)]
+res_dt[, `:=`(PC4CODE = as.factor(PC4CODE), obs_freq = ncl_tpl/Exposure, glm_freq = glm_ncl/Exposure)][,std_freq:=sqrt(obs_freq/Exposure)]
+# res_dt[,`:=`(
+#       geom_res_freq = (obs_freq / glm_freq),
+#       arithm_res_freq = (obs_freq - glm_freq)
+#       )]
+res_tr  = res_dt[sample2 == 1]
+res_v   = res_dt[sample2 == 2]
+res_tt  = res_dt[sample2 == 20]
+```
+
+At the first stage I didn't have a val set (only train and test already aggregated at the PC4 level). Ideally, the roughness parameter (hyper param of the GAM+GMRF) should be chosen by evalutation on the validation set. I set it by hand (as a guess value).
+
+
+```{r, fig.height = 23, fig.width = 17, warning=FALSE, error=FALSE, message=FALSE}
+# you can change the fig.width=16 by out.width = '90%' while compiling to html 
+
+# define the colour of the NA on the map, I chose Monza red
+na_colour = "#cf000f"   #"#d8d224" #'#cf000f' 
+
+###########################################################
+# Load the shapefile provided by Allsecur                 #
+# if necessary it can be updated using the free resource: #
+# http://geoplaza.vu.nl/data/dataset/postcode             #
+###########################################################
+nl_shp = rgdal::readOGR('D:/Users/EUDZ040/R/005_zoning_allsecur/Zoning-git/Shape/Nlp4_r14.shp')
+# Re-load in different format, much more easier to plot then
+nl_st = sf::st_read('D:/Users/EUDZ040/R/005_zoning_allsecur/Zoning-git/Shape/Nlp4_r14.shp')
+
+# Convert the coordinates
+nl_shp@data$XCOORD = nl_shp@data$XCOORD/10000
+nl_shp@data$YCOORD = nl_shp@data$YCOORD/10000
+nl_st$XCOORD = nl_st$XCOORD/10000
+nl_st$YCOORD = nl_st$YCOORD/10000
+
+# create the polygons at the PC3CODE levels. Avoid to draw borders at the PC4CODE levels because too many --> bad for visualization
+nl_st_pc2  = group_by(nl_st, PC2CODE) %>% summarize(do_union = TRUE)
+
+# shp <- shapefile("D:/Users/EUDZ040/R/005_zoning_allsecur/Alessandra_files/Nlp4_r14.shp")
+
+#######################################
+# Load the data about the Emblem GLM  #
+# The .py is maintained by Alessadra  #
+# @ 18/01/2019 (csv write)            #
+#######################################
+res_train = copy(res_tr) #xfread('D:/Users/EUDZ040/R/005_zoning_allsecur/Alessandra_files/res_training_set.csv')
+
+#################
+#   Data prep   #
+#################
+
+# Drop the unnecessary columns
+#res_train = res_train[, -c('V1', "freq_all")]
+
+# Rename pedestrian way but more readable
+# old_names = c("freq_all_exp")
+# new_names = c("glm_ncl")
+# setnames(res_train, old = old_names, new = new_names)
+# 
+# # Compute the freq, geometric and arithmetic residuals
+# res_train[, `:=`(PC4CODE = as.factor(PC4CODE) , obs_freq = ncl_tpl/Exposure, glm_freq = glm_ncl/Exposure)][,std_freq:=sqrt(obs_freq/Exposure)]
+
+# Some observed frequencies are artificially large (low exposure) since the observed freq is computed on very few observations.
+# I cap the residuals to the 2.5 and 97.5 percentile values to avoid too large values
+# This capping should be imporved
+res_train[, `:=`(obs_freq_raw = obs_freq)][, `:=`(obs_freq = squish(obs_freq, quantile(obs_freq, c(.025, .975), na.rm = T) ))]
+
+res_train[,`:=`(
+  geom_res_freq = (obs_freq / glm_freq),
+  arithm_res_freq = (obs_freq - glm_freq), 
+  geom_res_ncl =  (ncl_tpl / glm_ncl),
+  arithm_res_ncl =  (ncl_tpl - glm_ncl) )]
+
+# Store the Geom res scale and scale to [0,1] for a beta regression (Gamma not allowed since some residuals = 0)
+max_geom_freq = max(res_train$geom_res_freq, na.rm = T)
+res_train[, geom_res_freq := geom_res_freq/max_geom_freq]
+
+
+# Extract the data from the shapefile
+states_df <- nl_shp %>%   
+  as.data.table() %>% 
+  droplevels()
+
+# Left outer join, keep all records from the states_df (see the following tutorial if your are not used to mighty data.table https://rstudio-pubs-static.s3.amazonaws.com/52230_5ae0d25125b544caab32f75f0360e775.html)
+states_df = res_train[states_df, on = c(PC4CODE = "PC4CODE")]
+
+# Drop the NA in the n_cl, otherwise the GMRF will not work!
+states_df = states_df[!is.na(states_df$ncl_tpl), ]
+
+# List all the remaining zipcodes
+zc_pc4 = unique(states_df$PC4CODE)
+
+#subset the shapefile
+shp_subset = subset(nl_shp, PC4CODE %in% zc_pc4)
+
+# Build the lattice for the GMRF (discrete version of the Gaussian Process)
+nb <- spdep::poly2nb(shp_subset, row.names = states_df$PC4CODE)
+names(nb) <- attr(nb, "region.id")
+
+# If you want to use coordinate, it's also possible. Something like (not tested on this data set)
+# xy <- cbind(states_df$XCOORD, states_df$YCOORD)
+# nb <- spdep::tri2nb(xy, row.names = states_df$PC4CODE )
+# names(nb) <- attr(nb, "region.id")
+
+# use 6 parallel threads, reduce if fewer physical CPU cores
+ctrl <- gam.control(nthreads = 6) 
+
+######################################################################################################################################
+#                                                                                                                                    #
+# Fitting the GAM regression with GMRF as basis (discrete version of GP)                                                             #
+# Try to change the roughness param to see the effect                                                                                #
+#                                                                                                                                    #
+# roughness_param == should be an integer, the lower the smoother the plot (the rank of the MRF, the lower the rank the smoother)    #
+#                    if you remove k-param from the below fit, the fit will be done with full rand GMRF                              #
+######################################################################################################################################
+roughness_param = 150
+gam_mrf <- gam(geom_res_freq ~ s(PC4CODE, bs = 'mrf', k = roughness_param, xt = list(nb = nb)), # define MRF smooth
+               data = states_df,
+               method = 'REML', 
+               family = betar,  # fit a beta regression
+               control = ctrl) 
+
+# Print out the summary
+summary(gam_mrf)
+
+# Add the prediction to the data.frame
+states_df = states_df %>% 
+  mutate(fit = predict(gam_mrf, type='response') * max_geom_freq, geom_res_freq = geom_res_freq * max_geom_freq) # restore the scale
+states_df = setDT(states_df)
+
+# Join the in sample prediction
+insample_pred_gmrf = setDT(full_join(nl_st, states_df[, .(PC4CODE, fit, glm_ncl, ncl_tpl, Exposure, obs_freq, glm_freq,
+                                                geom_res_freq, arithm_res_freq, geom_res_ncl, arithm_res_ncl)], 
+                           by = c("PC4CODE" = "PC4CODE")))
+```
+
+
+```{r, fig.height = 23, fig.width = 17, warning=FALSE, error=FALSE, message=FALSE}
+# Plot the results
+plot_insample_pred <- ggplot() + theme_fivethirtyeight() +
+    guides(fill = guide_colorbar(barwidth = 16, barheight = 3), color = FALSE) + 
+    geom_sf(data = insample_pred_gmrf, aes(fill = fit, color = fit),lwd = 0) + 
+    #geom_sf(data = nl_st_pc2, lwd=0.0001, colour = "gray80", fill = NA) + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+
+plot_list <- list()
+
+viridis_pal_names <- c('viridis', 'cividis', 'magma', 'inferno')  # , 'plasma'
+n_palettes = length(viridis_pal_names)
+
+for (i in seq(1,n_palettes)) {
+  plot_list[[i]] <- plot_insample_pred + 
+                    scale_fill_viridis(option=viridis_pal_names[i], na.value=na_colour) + 
+                    scale_colour_viridis(option=viridis_pal_names[i])+
+                    ggtitle(viridis_pal_names[i])
+                    
+}
+
+# Wanna see scientific colour palettes ?
+do.call(plot_grid, c(plot_list, ncol=2))
+
+```
+
+
+However since we are speaking of residuals, I highly recommend a diverging colour palette. The differentiation between less or greater than 1 will be easier and the results better illustrated. Here is the rendering (the `r sum(is.na(insample_pred_gmrf$n_cl))` are coded in red):
+
+
+```{r, fig.height = 11, fig.width = 16, warning=FALSE, error=FALSE, message=FALSE}
+max_val = max(insample_pred_gmrf$fit, na.rm = T)
+min_val = min(0, min(insample_pred_gmrf$fit, na.rm = T) )
+
+# nice scientific palette color for gradient with midpoint
+curl_cols = c('#151D44', '#156D73', '#7DB390', '#FEF6F5', '#DB8C77', '#9D3060', '#340D35') 
+
+plot_insample_true <- ggplot() + theme_fivethirtyeight() +
+  guides(fill = guide_colorbar(barwidth = 16, barheight = 3), color = FALSE) + 
+  geom_sf(data = insample_pred_gmrf, aes(fill = geom_res_freq, color = geom_res_freq), lwd=0) + 
+  geom_sf(data = insample_pred_gmrf[geom_res_freq > max_val], lwd=0, color = "#340d35", fill = "#340d35") +
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+
+
+# colpal inspired by one of the cmocean
+plot_insample_pred <- plot_insample_pred + 
+  scale_colour_gradientn(colours = pals::ocean.delta(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) +
+  scale_fill_gradientn(colours = pals::ocean.delta(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) +
+  labs(title = "Smoothed geometric residuals",
+                subtitle = "NAs (red): missing observations in the training set")
+  
+
+plot_insample_true <- plot_insample_true + 
+  scale_colour_gradientn(colours = pals::ocean.delta(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) +
+  scale_fill_gradientn(colours = pals::ocean.delta(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) +
+  labs(title = "Raw residuals",
+              subtitle = "NAs (red): missing observations in the training set")
+
+plot_grid(plot_insample_true, plot_insample_pred, ncol=2)
+```
+
+
+
+Please, forget even the existence of the jet colour map. They are so many papers on this but a picture is worth a thousand words:
+
+
+
+
+```{r, fig.height = 11, fig.width = 16, warning=FALSE, error=FALSE, message=FALSE}
+max_val = max(insample_pred_gmrf$fit, na.rm = T)
+min_val = min(0, min(insample_pred_gmrf$fit, na.rm = T) )
+
+# nice scientific palette color for gradient with midpoint
+curl_cols = c('#151D44', '#156D73', '#7DB390', '#FEF6F5', '#DB8C77', '#9D3060', '#340D35') 
+
+
+
+
+# colpal inspired by one of the cmocean
+plot_insample_pred_jet <- plot_insample_pred + 
+  scale_colour_gradientn(colours = pals::jet(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) +
+  scale_fill_gradientn(colours = pals::jet(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) +
+  labs(title = "Smoothed geometric residuals",
+                subtitle = "NAs (red): missing observations in the training set")
+  
+plot_insample_true_jet <- plot_insample_true + 
+  scale_colour_gradientn(colours = pals::jet(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) +
+  scale_fill_gradientn(colours = pals::jet(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) +
+  labs(title = "Raw residuals",
+              subtitle = "NAs (red): missing observations in the training set")
+
+
+plot_grid(plot_insample_true_jet, plot_insample_pred_jet, ncol=2)
+```
+
+
+
+
+One cannot distinguish anything using the jet colour map. Information that we hardly extracted from the data are hidden and non interpretable (no boundaries between positive and negative, cluster are fuzzy, non uniform and misleading colour intensity, etc.).
+If for an obscure reason, one really really wants a rainbow like colour map, at least one should use a uniformized rainbow map like the one provided by https://peterkovesi.com/projects/colourmaps/ 
+
+
+
+```{r, fig.height = 11, fig.width = 16, warning=FALSE, error=FALSE, message=FALSE}
+max_val = max(insample_pred_gmrf$fit, na.rm = T)
+min_val = min(0, min(insample_pred_gmrf$fit, na.rm = T) )
+
+# nice scientific palette color for gradient with midpoint
+curl_cols = c('#151D44', '#156D73', '#7DB390', '#FEF6F5', '#DB8C77', '#9D3060', '#340D35') 
+
+
+
+
+# colpal inspired by one of the cmocean
+plot_insample_true_ko <- plot_insample_true + 
+  scale_colour_gradientn(colours = pals::kovesi.rainbow(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) +
+  scale_fill_gradientn(colours = pals::kovesi.rainbow(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) +
+  labs(title = "Raw residuals",
+              subtitle = "NAs (red): missing observations in the training set")
+
+  
+
+plot_insample_pred_ko <- plot_insample_pred + 
+  scale_colour_gradientn(colours = pals::kovesi.rainbow(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) +
+  scale_fill_gradientn(colours = pals::kovesi.rainbow(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) +
+  labs(title = "Smoothed geometric residuals",
+                subtitle = "NAs (red): missing observations in the training set")
+
+plot_grid(plot_insample_true_ko, plot_insample_pred_ko, ncol=2)
+```
+
+
+
+## Continuous smoothing: GAM with GP basis smoothing
+
+```{r, fig.height = 11.5, fig.width = 7, warning=FALSE, error=FALSE, message=FALSE}
+# you can change the fig.width=16 by out.width = '90%' while compiling to html 
+
+###########################################################
+# Load the shapefile provided by Allsecur                 #
+# if necessary it can be updated using the free resource: #
+# http://geoplaza.vu.nl/data/dataset/postcode             #
+###########################################################
+nl_shp = rgdal::readOGR('D:/Users/EUDZ040/R/005_zoning_allsecur/Zoning-git/Shape/Nlp4_r14.shp')
+# Re-load in different format, much more easier to plot then
+nl_st = sf::st_read('D:/Users/EUDZ040/R/005_zoning_allsecur/Zoning-git/Shape/Nlp4_r14.shp')
+
+#######################################
+# Load the data about the Emblem GLM  #
+# The .py is maintained by Alessadra  #
+# @ 18/01/2019 (csv write)            #
+#######################################
+res_train = res_train = copy(res_tr) #fread('D:/Users/EUDZ040/R/005_zoning_allsecur/Alessandra_files/res_training_set.csv')
+
+#################
+#   Data prep   #
+#################
+
+# Drop the unnecessary columns
+#res_train = res_train[, -c('V1', "freq_all")]
+
+# Rename pedestrian way but more readable
+# old_names = c("freq_all_exp")
+# new_names = c("glm_ncl")
+# setnames(res_train, old = old_names, new = new_names)
+
+# Compute the freq, geometric and arithmetic residuals
+# res_train[, `:=`(PC4CODE = as.factor(PC4CODE), obs_freq = ncl_tpl/Exposure, glm_freq = glm_ncl/Exposure)][,std_freq:=sqrt(obs_freq/Exposure)]
+
+# Some observed frequencies are artificially large (low exposure) since the observed freq is computed on very few observations.
+# I cap the residuals to the 2.5 and 97.5 percentile values to avoid too large values
+# This capping should be imporved
+res_train[, `:=`(obs_freq_raw = obs_freq)][, `:=`(obs_freq = squish(obs_freq, quantile(obs_freq, c(.025, .975), na.rm = T) ))]
+
+res_train[,`:=`(
+  geom_res_freq = (obs_freq / glm_freq),
+  arithm_res_freq = (obs_freq - glm_freq), 
+  geom_res_ncl =  (ncl_tpl / glm_ncl),
+  arithm_res_ncl =  (ncl_tpl - glm_ncl) )]
+
+
+# Extract the data from the shapefile
+states_df <- nl_shp %>%   
+  as.data.table() %>% 
+  droplevels()
+
+# rescale the coordinates
+states_df[, `:=`(XCOORD = XCOORD/1e4, YCOORD = YCOORD/1e4)]
+
+# Left outer join, keep all records from the states_df (see the following tutorial if your are not used to mighty data.table https://rstudio-pubs-static.s3.amazonaws.com/52230_5ae0d25125b544caab32f75f0360e775.html)
+states_df = res_train[states_df, on = c(PC4CODE = "PC4CODE")]
+
+# Drop the NA in the n_cl, otherwise the GMRF will not work!
+states_df = states_df[!is.na(states_df$ncl_tpl), ]
+
+# List all the remaining zipcodes
+zc_pc4 = unique(states_df$PC4CODE)
+
+#subset the shapefile
+shp_subset = subset(nl_shp, PC4CODE %in% zc_pc4)
+
+# Build the lattice for the GMRF (discrete version of the Gaussian Process)
+nb <- spdep::poly2nb(shp_subset, row.names = states_df$PC4CODE)
+names(nb) <- attr(nb, "region.id")
+
+# If you want to use coordinate, it's also possible. Something like (not tested on this data set)
+# xy <- cbind(states_df$XCOORD/10000, states_df$YCOORD/10000)
+# nb <- spdep::tri2nb(xy, row.names = as.factor(as.character(states_df$PC4CODE)) )
+# names(nb) <- attr(nb, "region.id")
+
+# use 6 parallel threads, reduce if fewer physical CPU cores
+ctrl <- gam.control(nthreads = 6) 
+
+######################################################################################################################################
+#                                                                                                                                    #
+# Fitting the GAM regression with GP                                                                                                 #
+# Try to change the roughness param to see the effect                                                                                #
+#                                                                                                                                    #
+# roughness_param == should be an integer, the lower the smoother the plot (the rank of the MRF, the lower the rank the smoother)    #
+#                    if you remove k-param from the below fit, the fit will be done with full rand GMRF                              #
+######################################################################################################################################
+# The m argument allows to specify different types of covariance functions.
+gam_gp = gam(geom_res_freq ~ s(XCOORD, YCOORD, bs = 'gp', k = roughness_param, m = c(1, 0.175)), # define GP smooth, using Mattern basis 
+               data = states_df,
+               control = ctrl) 
+
+# Print out the summary
+summary(gam_gp)
+
+# Add the prediction to the data.frame
+states_df = states_df %>% 
+  mutate(fit = predict(gam_gp, type='response')) 
+states_df = setDT(states_df)
+
+# Re-load in different format, much more easier to plot then
+nl_st = st_read('D:/Users/EUDZ040/R/005_zoning_allsecur/Zoning-git/Shape/Nlp4_r14.shp')
+
+# Join the in sample prediction
+insample_pred = setDT(full_join(nl_st, states_df[, .(PC4CODE, fit, glm_ncl, ncl_tpl, Exposure, obs_freq, glm_freq,
+                                                geom_res_freq, arithm_res_freq, geom_res_ncl, arithm_res_ncl)], 
+                           by = c("PC4CODE" = "PC4CODE")) )
+```
+
+
+```{r, fig.height = 11.5, fig.width = 7, warning=FALSE, error=FALSE, message=FALSE}
+# plot thr results
+plot_insample_pred <- ggplot() + theme_fivethirtyeight() + 
+  geom_sf(data = insample_pred, aes(fill = fit), lwd=0.0001, color = "gray80")  + 
+  guides(fill = guide_colorbar(barwidth = 16, barheight = 3)) + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+
+plot_list <- list()
+
+viridis_pal_names <- c('viridis', 'cividis', 'magma', 'inferno')  # , 'plasma'
+n_palettes = length(viridis_pal_names)
+
+# for (i in seq(1,n_palettes)) {
+#   plot_list[[i]] <- plot_insample_pred + scale_fill_viridis(option=viridis_pal_names[i]) + ggtitle(viridis_pal_names[i])  
+# }
+# 
+# # Wanna see scientific colour palettes ?
+# do.call(plot_grid, c(plot_list, ncol=2))
+
+
+plot_insample_pred_gp <- plot_insample_pred + scale_fill_viridis(option=viridis_pal_names[1], na.value=na_colour) + 
+                         labs(title = "Smoothed geometric residuals", subtitle = "NAs (red): missing observations in the training set")
+
+plot_insample_pred_gp
+```
+
+
+The thing is that GP are flexible but quite smooth, too smooth for the present application, besides continuous instead of discrete.
+
+
+
+
+## Hierarchical clustering of the smoothed residuals
+
+Note that clustering the smoothed residuals, meaning $\mathrm{res}_\mathrm{smooth}$ instead of $\mathrm{res}_\mathrm{gml}$, will return a much more homogeneous spatial distribution. 
+
+```{r}
+res_res_dt = insample_pred_gmrf[, .(PC4CODE, geom_res_freq, fit)][, res_res := geom_res_freq - fit]
+
+# Clustering works best with scaled variables
+res_res_dt[, res_res_sc := scale(res_res)]
+
+# note there are some NA in the input
+na_dt = res_res_dt[is.na(res_res_sc)]
+
+# let's remove them
+res_res_dt = res_res_dt[!is.na(res_res_sc)]
+
+# Dissimilarity matrix
+#d <- dist(res_res_dt$res_res_sc, method = "euclidean") # res of res will give more or less the same zoning than using the raw res...
+d <- dist(res_res_dt$fit, method = "euclidean") 
+
+# Hierarchical clustering using Ward's method
+res.hc <- hclust(d, method = "ward.D2" )
+
+# Cut tree into n groups
+n_zone30 = 30
+grp30 <- cutree(res.hc, k = n_zone30)
+
+# Cut tree into n groups
+n_zone20 = 20
+grp20 <- cutree(res.hc, k = n_zone20)
+
+# Cut tree into n groups
+n_zone10 = 10
+grp10 <- cutree(res.hc, k = n_zone10)
+```
+
+
+```{r, results='asis'}
+# Number of members in each cluster
+pander( table(grp20) )
+```
+
+Probably too many zones.
+
+```{r, results='asis'}
+# Number of members in each cluster
+pander( table(grp10) )
+```
+
+```{r}
+# Clustering works best with scaled variables
+res_res_dt[, `:=`(zone30 = as.factor(grp30), zone20 = as.factor(grp20), zone10 = as.factor(grp10))]
+
+# joining to the shapefile
+nl_st = sf::st_read('D:/Users/EUDZ040/R/005_zoning_allsecur/Zoning-git/Shape/Nlp4_r14.shp')
+zones_gmrf = setDT( full_join(nl_st, res_res_dt, by = c("PC4CODE" = "PC4CODE") ) )
+
+# export the zones
+fwrite(zones_gmrf[, .(PC4CODE, PC3CODE, PC2CODE, PC1CODE, zone30, zone20, zone10)], "PC4zones_gamgmrf.csv")
+```
+
+
+The zones are illustrated hereafter in **qualitative colours**. The zones are the levels of a categorical variable, the way this variable was built discretizing the smoothed residuals and ordered the cluster (hierarchy). Therefore it also makes sense to illustrate the zones in *sequential* colours. I provide this illustration below the qualitative colours chart.
+
+
+```{r, fig.height = 11.5, fig.width = 18, warning=FALSE, error=FALSE, message=FALSE}
+# two col pal
+# col20 = scico(n_zone20, palette = 'batlow')
+# col10 = scico(n_zone10, palette = 'vik')
+
+# Maximal contrast:
+#https://sashat.me/2017/01/11/list-of-20-simple-distinct-colors/
+# I want Hue: http://tools.medialab.sciences-po.fr/iwanthue/
+col20 = c("#d4452f","#5cc047","#864ada","#b0af37","#573598","#4c8235","#cc50be","#58b495","#ce4374","#97ae6e","#6778c7","#d58734","#5399b8",
+"#793529","#c58cba","#3b562f","#673663","#cea174","#d2786f","#82662c")
+#col10 = c("#d8753d","#6c49c6","#89b640","#cb57c2","#5fad8a","#d1577a","#636f35","#65396e","#91513f","#7d8fc5")
+col10 = c('#7F3C8D', '#11A579', '#3969AC', '#F2B701', '#E73F74', '#80BA5A', '#E68310', '#008695', '#CF1C90', '#F97B72')
+
+# Plot the results
+plot_gmrf_zones20 <- ggplot(data = zones_gmrf, aes(fill = zone20)) + 
+  geom_sf(lwd=0.0001, colour = 'white') + theme_fivethirtyeight()  + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+    scale_fill_manual(values = col20, breaks = seq.int(1,n_zone20), na.value=na_colour) +
+    labs(title = "GMRF - 20 zones", subtitle = "NAs (red): missing observations in the training set") +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE))
+
+
+plot_gmrf_zones10 <- ggplot(data = zones_gmrf, aes(fill = zone10)) + 
+  geom_sf(lwd=0.0001, colour = 'white') + theme_fivethirtyeight()  + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+    scale_fill_manual(values = col10, breaks = seq.int(1,n_zone10), na.value=na_colour ) + 
+    labs(title = "GMRF - 10 zones", subtitle = "NAs (red): missing observations in the training set") + 
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE))
+
+# plot the grid
+plot_grid(plot_gmrf_zones20, plot_gmrf_zones10) 
+```
+
+
+
+
+The zones in **sequential colours**
+
+
+
+```{r, fig.height = 11.5, fig.width = 18, warning=FALSE, error=FALSE, message=FALSE}
+# two col pal
+# col20 = scico(n_zone20, palette = 'batlow')
+# col10 = scico(n_zone10, palette = 'vik')
+
+# Maximal contrast:
+#https://sashat.me/2017/01/11/list-of-20-simple-distinct-colors/
+# I want Hue: http://tools.medialab.sciences-po.fr/iwanthue/
+col20 = c("#d4452f","#5cc047","#864ada","#b0af37","#573598","#4c8235","#cc50be","#58b495","#ce4374","#97ae6e","#6778c7","#d58734","#5399b8",
+"#793529","#c58cba","#3b562f","#673663","#cea174","#d2786f","#82662c")
+#col10 = c("#d8753d","#6c49c6","#89b640","#cb57c2","#5fad8a","#d1577a","#636f35","#65396e","#91513f","#7d8fc5")
+col10 = c('#7F3C8D', '#11A579', '#3969AC', '#F2B701', '#E73F74', '#80BA5A', '#E68310', '#008695', '#CF1C90', '#F97B72')
+
+# Plot the results
+plot_gmrf_zones20 <- ggplot(data = zones_gmrf, aes(fill = zone20)) + 
+  geom_sf(lwd=0.0001, colour = 'white') + theme_fivethirtyeight()  + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+    scale_fill_manual(values = rev(pals::ocean.haline(length(col20))), breaks = seq.int(1,n_zone20), na.value=na_colour) +
+    labs(title = "GMRF - 20 zones", subtitle = "NAs (red): missing observations in the training set") +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE))
+
+
+plot_gmrf_zones10 <- ggplot(data = zones_gmrf, aes(fill = zone10)) + 
+  geom_sf(lwd=0.0001, colour = 'white') + theme_fivethirtyeight()  + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+    scale_fill_manual(values = rev(pals::ocean.haline(length(col10))), breaks = seq.int(1,n_zone10), na.value=na_colour ) + 
+    labs(title = "GMRF - 10 zones", subtitle = "NAs (red): missing observations in the training set") + 
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE))
+
+# plot the grid
+plot_grid(plot_gmrf_zones20, plot_gmrf_zones10) 
+```
+
+
+
+
+
+## Comparison to the SAS implemented method (weighted average and credibility)
+
+As Allsecur did 30 zones, let's re-cut the hierarchical tree and plot the zones for comparison.
+
+```{r, fig.height = 11.5, fig.width = 7, warning=FALSE, error=FALSE, message=FALSE}
+# you can change the fig.width=16 by out.width = '90%' while compiling to html 
+
+###########################################################
+# Load the shapefile provided by Allsecur                 #
+# if necessary it can be updated using the free resource: #
+# http://geoplaza.vu.nl/data/dataset/postcode             #
+###########################################################
+
+# Re-load in different format, much more easier to plot then
+nl_st = sf::st_read('D:/Users/EUDZ040/R/005_zoning_allsecur/Zoning-git/Shape/Nlp4_r14.shp')
+
+#######################################
+# Load the data about the Emblem GLM  #
+# The .py is maintained by Alessadra  #
+# @ 18/01/2019 (csv write)            #
+#######################################
+sas_smooth      = setDT(read_sas('D:/Users/EUDZ040/R/005_zoning_allsecur/Alessandra_files/map_smoothed_freq.sas7bdat'))
+sas_mapping_tab = setDT(read_sas('D:/Users/EUDZ040/R/005_zoning_allsecur/Alessandra_files/legend.sas7bdat'))
+
+sas_smoothed_freq = sas_mapping_tab[sas_smooth, on = .(index)][, `:=`(PC4CODE = as.factor(PC4CODE), cluster_fastclus =            as.factor(cluster_fastclus))]
+
+# Join the in sample prediction
+sas_pred = setDT(full_join(nl_st, sas_smoothed_freq, by = c("PC4CODE" = "PC4CODE")) )
+```
+
+
+```{r, fig.height = 11, fig.width = 16, warning=FALSE, error=FALSE, message=FALSE}
+max_val = max(insample_pred_gmrf$fit, na.rm = T)
+min_val = min(0, min(insample_pred_gmrf$fit, na.rm = T) )
+
+# nice scientific palette color for gradient with midpoint
+curl_cols = c('#151D44', '#156D73', '#7DB390', '#FEF6F5', '#DB8C77', '#9D3060', '#340D35') 
+
+
+plot_insample_pred <- ggplot() + theme_fivethirtyeight() +
+    guides(fill = guide_colorbar(barwidth = 16, barheight = 3), color = FALSE) + 
+    geom_sf(data = insample_pred_gmrf, aes(fill = fit, color = fit),lwd = 0) + 
+    #geom_sf(data = nl_st_pc2, lwd=0.0001, colour = "gray80", fill = NA) + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+
+
+plot_insample_pred <- plot_insample_pred + 
+  scale_colour_gradientn(colours = pals::ocean.delta(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) +
+  scale_fill_gradientn(colours = pals::ocean.delta(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) +
+  labs(title = "GMRF smoothed residuals",
+              subtitle = "NAs (red): missing observations in the training set")
+
+
+
+plot_sas <- ggplot() + theme_fivethirtyeight() +
+  guides(fill = guide_colorbar(barwidth = 16, barheight = 3), color = FALSE) + 
+  geom_sf(data = sas_pred, aes(fill = res_freq, color = res_freq), lwd=0) + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+
+
+plot_sas <- plot_sas + 
+  scale_colour_gradientn(colours = pals::ocean.delta(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) +
+  scale_fill_gradientn(colours = pals::ocean.delta(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) +
+  labs(title = "SAS smoothed residuals",
+              subtitle = "NAs (red): missing observations in the training set")
+
+plot_grid(plot_sas, plot_insample_pred, ncol=2)
+```
+
+and comparing the zones. Using the hierarchical clustering, several zones will be almost empty
+
+
+```{r, results='asis'}
+# Number of members in each cluster
+pander( table(grp30) )
+```
+
+In the SAS procedure, the distribution is 
+
+```{r, results='asis'}
+# Number of members in each cluster
+pander( table(sas_pred$cluster_fastclus) )
+```
+
+
+
+
+
+```{r, fig.height = 11.5, fig.width = 18, warning=FALSE, error=FALSE, message=FALSE}
+# two col pal
+# col20 = scico(n_zone20, palette = 'batlow')
+# col10 = scico(n_zone10, palette = 'vik')
+
+# Maximal contrast:
+#https://sashat.me/2017/01/11/list-of-20-simple-distinct-colors/
+# I want Hue: http://tools.medialab.sciences-po.fr/iwanthue/
+col20 = c("#d4452f","#5cc047","#864ada","#b0af37","#573598","#4c8235","#cc50be","#58b495","#ce4374","#97ae6e","#6778c7","#d58734","#5399b8",
+"#793529","#c58cba","#3b562f","#673663","#cea174","#d2786f","#82662c")
+#col10 = c("#d8753d","#6c49c6","#89b640","#cb57c2","#5fad8a","#d1577a","#636f35","#65396e","#91513f","#7d8fc5")
+col10 = c('#7F3C8D', '#11A579', '#3969AC', '#F2B701', '#E73F74', '#80BA5A', '#E68310', '#008695', '#CF1C90', '#F97B72')
+
+# Plot the results
+plot_gmrf_zones30 <- ggplot(data = zones_gmrf, aes(fill = zone30)) + 
+  geom_sf(lwd=0.0001, colour = 'white') + theme_fivethirtyeight()  + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+    scale_fill_manual(values = rev(pals::ocean.haline(30)), breaks = seq.int(1,30), na.value=na_colour) +
+    labs(title = "GMRF - 30 zones", subtitle = "NAs (red): missing observations in the training set") +
+  guides(fill = guide_legend(nrow = 3, byrow = TRUE))
+
+
+plot_sas_zones30 <- ggplot(data = sas_pred, aes(fill = cluster_fastclus)) + 
+  geom_sf(lwd=0.0001, colour = 'white') + theme_fivethirtyeight()  + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+    scale_fill_manual(values = rev(pals::ocean.haline(30)), breaks = seq.int(1,30), na.value=na_colour) +
+    labs(title = "SAS - 30 zones", subtitle = "NAs (red): missing observations in the training set") +
+  guides(fill = guide_legend(nrow = 3, byrow = TRUE))
+
+# plot the grid
+plot_grid(plot_gmrf_zones30, plot_sas_zones30) 
+```
+
+
+In qualitative colours:
+
+
+```{r, fig.height = 11.5, fig.width = 18, warning=FALSE, error=FALSE, message=FALSE}
+# two col pal
+# col20 = scico(n_zone20, palette = 'batlow')
+# col10 = scico(n_zone10, palette = 'vik')
+
+# Maximal contrast:
+#https://sashat.me/2017/01/11/list-of-20-simple-distinct-colors/
+# I want Hue: http://tools.medialab.sciences-po.fr/iwanthue/
+col30 = c("#6666d6","#88bd36","#b05ed2","#50c257","#ce4fad","#3a8736","#d84c8b","#66c281","#d33c59","#57cbb2","#c5432c","#4cbee0","#e0753a","#5e93d0","#c0b338",
+"#6b74c1","#da9835","#8b4f99","#6a9e3d","#d690cc","#8d852b","#9e4a69","#489970","#d57571","#2f9c96","#995e2b","#316f43","#d6a16c","#686c2c","#a4b165")
+
+
+# Plot the results
+plot_gmrf_zones30 <- ggplot(data = zones_gmrf, aes(fill = zone30)) + 
+  geom_sf(lwd=0.0001, colour = 'white') + theme_fivethirtyeight()  + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+    scale_fill_manual(values = col30 , breaks = seq.int(1,30), na.value=na_colour) +
+    labs(title = "GMRF - 30 zones", subtitle = "NAs (red): missing observations in the training set") +
+  guides(fill = guide_legend(nrow = 3, byrow = TRUE))
+
+
+plot_sas_zones30 <- ggplot(data = sas_pred, aes(fill = cluster_fastclus)) + 
+  geom_sf(lwd=0.0001, colour = 'white') + theme_fivethirtyeight()  + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+    scale_fill_manual(values = col30, breaks = seq.int(1,30), na.value=na_colour) +
+    labs(title = "SAS - 30 zones", subtitle = "NAs (red): missing observations in the training set") +
+  guides(fill = guide_legend(nrow = 3, byrow = TRUE))
+
+# plot the grid
+plot_grid(plot_gmrf_zones30, plot_sas_zones30) 
+```
+
+
+
+
+
+## Prediction on the test set
+
+Note that since NAs have been encountered in the GMRF fitting (no observation for some zip code in the training set), one cannot predict a value for those zip code. Indeed they have been removed before the lattice setting because the lattice cannot be defined based on NAs. If you want to be able to predict for all zip code, make imputation or be sure to have at least one observation per zip code or reduce the granularity.
+
+```{r}
+# you can change the fig.width=16 by out.width = '90%' while compiling to html 
+
+###########################################################
+# Load the shapefile provided by Allsecur                 #
+# if necessary it can be updated using the free resource: #
+# http://geoplaza.vu.nl/data/dataset/postcode             #
+###########################################################
+nl_shp = rgdal::readOGR('D:/Users/EUDZ040/R/005_zoning_allsecur/Zoning-git/Shape/Nlp4_r14.shp')
+# Re-load in different format, much more easier to plot then
+nl_st = sf::st_read('D:/Users/EUDZ040/R/005_zoning_allsecur/Zoning-git/Shape/Nlp4_r14.shp')
+
+# Convert the coordinates
+nl_shp@data$XCOORD = nl_shp@data$XCOORD/10000
+nl_shp@data$YCOORD = nl_shp@data$YCOORD/10000
+nl_st$XCOORD = nl_st$XCOORD/10000
+nl_st$YCOORD = nl_st$YCOORD/10000
+
+# shp <- shapefile("D:/Users/EUDZ040/R/005_zoning_allsecur/Alessandra_files/Nlp4_r14.shp")
+
+#######################################
+# Load the data about the Emblem GLM  #
+# The .py is maintained by Alessadra  #
+# @ 18/01/2019 (csv write)            #
+#######################################
+res_test = copy(res_tt) #fread('D:/Users/EUDZ040/R/005_zoning_allsecur/Alessandra_files/res_test_set.csv')
+
+#################
+#   Data prep   #
+#################
+
+# Drop the unnecessary columns
+# res_test = res_test[, -c('V1', "freq_all")]
+# 
+# # Rename pedestrian way but more readable
+# old_names = c("freq_all_exp")
+# new_names = c("glm_ncl")
+# setnames(res_test, old = old_names, new = new_names)
+# 
+# # Compute the freq, geometric and arithmetic residuals
+# res_test[, `:=`(PC4CODE = as.factor(PC4CODE) , obs_freq = ncl_tpl/Exposure, glm_freq = glm_ncl/Exposure)][,std_freq:=sqrt(obs_freq/Exposure)]
+
+# Some observed frequencies are artificially large (low exposure) since the observed freq is computed on very few observations.
+# I cap the residuals to the 2.5 and 97.5 percentile values to avoid too large values
+# This capping should be imporved
+res_test[, `:=`(obs_freq_raw = obs_freq)][, `:=`(obs_freq = squish(obs_freq, quantile(obs_freq, c(.025, .975), na.rm = T) ))]
+
+res_test[,`:=`(
+  geom_res_freq = (obs_freq / glm_freq),
+  arithm_res_freq = (obs_freq - glm_freq), 
+  geom_res_ncl =  (ncl_tpl / glm_ncl),
+  arithm_res_ncl =  (ncl_tpl - glm_ncl) )]
+
+# Store the Geom res scale and scale to [0,1] for a beta regression (Gamma not allowed since some residuals = 0)
+#max_geom_freq = max(res_test$geom_res_freq, na.rm = T)
+res_test[, geom_res_freq := geom_res_freq/max_geom_freq] # using the scale of the train set
+
+
+# Extract the data from the shapefile
+states_df <- nl_shp %>%   
+  as.data.table() %>% 
+  droplevels()
+
+# Left outer join, keep all records from the states_df (see the following tutorial if your are not used to mighty data.table https://rstudio-pubs-static.s3.amazonaws.com/52230_5ae0d25125b544caab32f75f0360e775.html)
+states_test_df = res_test[states_df, on = c(PC4CODE = "PC4CODE")]
+
+#################################################################
+# This is where the NAs issue implies not pred on 122 PC4codes  #
+#################################################################
+states_test_df = states_test_df[PC4CODE %in% zc_pc4]
+
+# Add the prediction to the data.frame
+states_test_pred = states_test_df %>% 
+  mutate(fit = predict(gam_mrf, type='response') * max_geom_freq, geom_res_freq = geom_res_freq * max_geom_freq) # restore the scale
+states_test_pred = setDT(states_test_pred)
+
+# Join the in sample prediction
+outsample_pred_gmrf = setDT(full_join(nl_st, states_test_pred[, .(PC4CODE, fit, glm_ncl, ncl_tpl, Exposure, obs_freq, glm_freq,
+                                                geom_res_freq, arithm_res_freq, geom_res_ncl, arithm_res_ncl)], 
+                           by = c("PC4CODE" = "PC4CODE")))
+```
+
+Let's plot the prediction and the target values
+
+```{r, fig.height = 11.5, fig.width = 18, warning=FALSE, error=FALSE, message=FALSE}
+
+max_val = max(outsample_pred_gmrf$fit, na.rm = T)
+min_val = min(0, min(outsample_pred_gmrf$fit, na.rm = T) )
+
+
+# Plot the results
+plot_outsample_pred <- ggplot(data = outsample_pred_gmrf, aes(fill = fit)) + 
+  geom_sf(lwd=0.0001, colour = 'white') + theme_fivethirtyeight() + guides(fill = guide_colorbar(barwidth = 16, barheight = 3)) + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+
+
+plot_outsample_true <- ggplot(data = outsample_pred_gmrf, aes(fill = geom_res_freq)) + 
+  geom_sf(lwd=0.0001, colour = 'white') + theme_fivethirtyeight() + guides(fill = guide_colorbar(barwidth = 16, barheight = 3)) + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+
+
+# colpal inspired by one of the cmocean
+plot_outsample_pred <- plot_outsample_pred + 
+  scale_colour_gradientn(colours = pals::ocean.delta(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) +
+  scale_fill_gradientn(colours = pals::ocean.delta(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) +
+  labs(title = "Smoothed geometric residuals", subtitle = "NAs (red): missing observations in the training set")
+
+plot_outsample_true <- plot_outsample_true + 
+  scale_colour_gradientn(colours = pals::ocean.delta(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) +
+  scale_fill_gradientn(colours = pals::ocean.delta(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) +
+  labs(title = "Raw geometric residuals", subtitle = "NAs (red): missing observations in the training set")
+
+plot_grid(plot_outsample_true, plot_outsample_pred, ncol=2)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Smoothing comparison of the smoothing at the PC4 and PC3 levels
+
+Just to given an idea, I provide here the equivalent at a more coarse grained level: the PC3 zip code. To do that, I'll take the aggregation of the provided GLM ncl just to avoid to re-predict the Emblem model at the PC2 level. If the results are satisfactory.
+
+
+## The different aggregation levels
+
+First let's visualize the difference between the two levels of granularity PC4 and PC3. In the following maps, the fill is done using the PC4 or PC3 code. No quantitative meaning, just differentiation of the areas.
+
+```{r, fig.height = 11, fig.width = 27, warning=FALSE, error=FALSE, message=FALSE}
+# you can change the fig.width=16 by out.width = '90%' while compiling to html 
+
+# define the colour of the NA on the map, I chose Monza red
+na_colour = '#cf000f' 
+
+###########################################################
+# Load the shapefile provided by Allsecur                 #
+# if necessary it can be updated using the free resource: #
+# http://geoplaza.vu.nl/data/dataset/postcode             #
+###########################################################
+# Re-load in different format, much more easier to plot then
+nl_st = sf::st_read('D:/Users/EUDZ040/R/005_zoning_allsecur/Zoning-git/Shape/Nlp4_r14.shp')
+nl_st$PC4NR   = as.factor(nl_st$PC4NR)
+nl_st$PC3CODE = as.factor(nl_st$PC3CODE)
+nl_st$PC2CODE = as.factor(nl_st$PC2CODE)
+
+# Merge polygons by ID
+nl_st_pc3  = group_by(nl_st, PC3CODE) %>% summarize(do_union = TRUE)
+nl_shp_pc3 = as(nl_st_pc3, "Spatial")
+
+nl_st_pc2  = group_by(nl_st, PC2CODE) %>% summarize(do_union = TRUE)
+nl_shp_pc2 = as(nl_st_pc2, "Spatial")
+
+
+# plot the areas with distinctive colours
+#col_base = c('#855C75', '#D9AF6B', '#AF6458', '#736F4C', '#526A83', '#625377', '#68855C') # Antique_7 from cartocolor
+col_base = c('#7F3C8D', '#11A579', '#3969AC', '#F2B701', '#E73F74', '#80BA5A') # Bold_6 from cartocolor
+
+pc4_cols = rep(col_base, length.out = length(unique(nl_st$PC4NR)))
+pc3_cols = rep(col_base, length.out = length(unique(nl_st_pc3$PC3CODE)))
+pc2_cols = rep(col_base, length.out = length(unique(nl_st_pc2$PC2CODE)))
+
+plot_pc4 <- ggplot(data = nl_st, aes(fill = PC4NR)) + 
+  geom_sf(lwd=0) + theme_fivethirtyeight() + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+scale_fill_manual(values = pc4_cols, guide=FALSE) +
+    labs(title = "PC4 areas")
+
+plot_pc3 <- ggplot(data = nl_st_pc3, aes(fill = PC3CODE)) + 
+  geom_sf(lwd=0) + theme_fivethirtyeight() + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+scale_fill_manual(values = pc3_cols, guide=FALSE) +
+    labs(title = "PC3 areas")
+
+plot_pc2 <- ggplot(data = nl_st_pc2, aes(fill = PC2CODE)) + 
+  geom_sf(lwd=0) + theme_fivethirtyeight() + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+scale_fill_manual(values = pc2_cols, guide=FALSE) +
+    labs(title = "PC2 areas")
+
+plot_grid(plot_pc4, plot_pc3, plot_pc2, ncol=3)
+
+```
+
+
+
+## Residuals at the different zipcode levels
+
+```{r, fig.height = 11, fig.width = 24, warning=FALSE, error=FALSE, message=FALSE}
+# you can change the fig.width=16 by out.width = '90%' while compiling to html 
+
+# define the colour of the NA on the map, I chose Monza red
+na_colour = '#cf000f' 
+
+###########################################################
+# Load the shapefile provided by Allsecur                 #
+# if necessary it can be updated using the free resource: #
+# http://geoplaza.vu.nl/data/dataset/postcode             #
+###########################################################
+nl_shp = rgdal::readOGR('D:/Users/EUDZ040/R/005_zoning_allsecur/Zoning-git/Shape/Nlp4_r14.shp')
+# Re-load in different format, much more easier to plot then
+nl_st = sf::st_read('D:/Users/EUDZ040/R/005_zoning_allsecur/Zoning-git/Shape/Nlp4_r14.shp')
+nl_st = rmapshaper::ms_simplify(nl_st, keep = 0.01,keep_shapes = TRUE)
+
+
+# Convert the coordinates
+nl_shp@data$XCOORD = nl_shp@data$XCOORD/10000
+nl_shp@data$YCOORD = nl_shp@data$YCOORD/10000
+nl_st$XCOORD = nl_st$XCOORD/10000
+nl_st$YCOORD = nl_st$YCOORD/10000
+
+# Merge polygons by ID
+nl_st_pc3  = group_by(nl_st, PC3CODE) %>% summarize(do_union = TRUE)
+nl_shp_pc3 = as(nl_st_pc3, "Spatial")
+
+nl_st_pc2  = group_by(nl_st, PC2CODE) %>% summarize(do_union = TRUE)
+nl_shp_pc2 = as(nl_st_pc2, "Spatial")
+
+
+#######################################
+# Load the data about the Emblem GLM  #
+# The .py is maintained by Alessadra  #
+# @ 18/01/2019 (csv write)            #
+#######################################
+res_train = copy(res_tr) #fread('D:/Users/EUDZ040/R/005_zoning_allsecur/Alessandra_files/res_training_set.csv')
+
+#################
+#   Data prep   #
+#################
+
+# Drop the unnecessary columns
+# res_train = res_train[, -c('V1', "freq_all")]
+# 
+# # Rename pedestrian way but more readable
+# old_names = c("freq_all_exp")
+# new_names = c("glm_ncl")
+# setnames(res_train, old = old_names, new = new_names)
+# 
+# # Compute the freq, geometric and arithmetic residuals
+# res_train[, `:=`(obs_freq = ncl_tpl/Exposure, glm_freq = glm_ncl/Exposure)][,std_freq:=sqrt(obs_freq/Exposure)]
+
+# Some observed frequencies are artificially large (low exposure) since the observed freq is computed on very few observations.
+# I cap the residuals to the 2.5 and 97.5 percentile values to avoid too large values
+# This capping should be imporved
+res_train[, `:=`(obs_freq_raw = obs_freq)][, `:=`(obs_freq = squish(obs_freq, quantile(obs_freq, c(.025, .975), na.rm = T) ))]
+
+res_train[,`:=`(
+  geom_res_freq = (obs_freq / glm_freq),
+  arithm_res_freq = (obs_freq - glm_freq), 
+  geom_res_ncl =  (ncl_tpl / glm_ncl),
+  arithm_res_ncl =  (ncl_tpl - glm_ncl),
+  PC3CODE = substr(as.character(PC4CODE), 1, 3),
+  PC2CODE = substr(as.character(PC4CODE), 1, 2) 
+  )]
+
+# Store them as categorical variable
+res_train[, `:=`(PC4CODE = as.factor(PC4CODE), PC3CODE = as.factor(PC3CODE), PC2CODE = as.factor(PC2CODE) )]
+
+# Compute the aggregated of the GLM residuals by PC3 and PC2, doing the way I did below preserve the number of rows (meaning res @PC2 and PC3 
+# are duplicated)
+res_train_pc3 = res_train[, .(exposure = sum(Exposure, na.rm = T), 
+                          ncl_tpl = sum(ncl_tpl, na.rm = T),
+                          glm_ncl = sum(glm_ncl, na.rm = T)), by = PC3CODE]
+res_train_pc3[, geom_res_freq := ncl_tpl/glm_ncl]
+
+res_train_pc2 = res_train[, .(exposure = sum(Exposure, na.rm = T), 
+                          ncl_tpl = sum(ncl_tpl, na.rm = T),
+                          glm_ncl = sum(glm_ncl, na.rm = T)), by = PC2CODE]
+res_train_pc2[, geom_res_freq := ncl_tpl/glm_ncl]
+
+nl_st_pc3 = full_join(res_train_pc3, nl_st_pc3, by = c("PC3CODE" = "PC3CODE") )
+nl_st_pc2 = full_join(res_train_pc2, nl_st_pc2, by = c("PC2CODE" = "PC2CODE") )
+nl_st     = full_join(res_train, nl_st, by = c("PC4CODE" = "PC4CODE") )
+
+# Set the scale for the charts, same scale for each
+max_pc2 = max(res_train_pc2$geom_res_freq, na.rm = T)
+max_pc3 = max(res_train_pc3$geom_res_freq, na.rm = T)
+max_pc4 = max(res_train$geom_res_freq, na.rm = T)
+
+max_val = max(c(max_pc2, max_pc3, max_pc4), na.rm = T) # the max possible value on the 3 different ranges is too large for visualization
+min_val = 0 # min possible value on the 3 different ranges
+
+plot_res_pc4 <- ggplot(data = nl_st, aes(fill = geom_res_freq)) + 
+  geom_sf(lwd=0.0001, colour = 'white') + theme_fivethirtyeight() + guides(fill = guide_colorbar(barwidth = 16, barheight = 3)) + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+  scale_fill_gradientn(colours = pals::ocean.delta(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) + 
+  labs(title = "Raw geometric residuals", subtitle = "PC4 level")
+
+plot_res_pc3 <- ggplot(data = nl_st_pc3, aes(fill = geom_res_freq)) + 
+  geom_sf(lwd=0.0001, colour = 'white') + theme_fivethirtyeight() + guides(fill = guide_colorbar(barwidth = 16, barheight = 3)) + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+  scale_fill_gradientn(colours = pals::ocean.delta(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) + 
+  labs(title = "Raw geometric residuals", subtitle = "PC3 level")
+
+plot_res_pc2 <- ggplot(data = nl_st_pc2, aes(fill = geom_res_freq)) + 
+  geom_sf(lwd=0.0001, colour = 'white') + theme_fivethirtyeight() + guides(fill = guide_colorbar(barwidth = 16, barheight = 3)) + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+  scale_fill_gradientn(colours = pals::ocean.delta(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) +
+  labs(title = "Raw geometric residuals", subtitle = "PC2 level")
+
+plot_grid(plot_res_pc4, plot_res_pc3, plot_res_pc2, ncol=3)
+```
+
+
+and the exposure at the different levels:
+
+
+```{r, fig.height = 11, fig.width = 23, warning=FALSE, error=FALSE, message=FALSE}
+
+# Set the scale for the charts, same scale for each
+max_pc2 = max(res_train_pc2$exposure, na.rm = T)
+max_pc3 = max(res_train_pc3$exposure, na.rm = T)
+max_pc4 = max(res_train$exposure, na.rm = T)
+
+max_val = max(c(max_pc2, max_pc3, max_pc4), na.rm = T)
+min_val = 0 #min(res_train$exp_pc2, na.rm = T)
+
+map_name = "tokyo"
+
+
+plot_res_pc4 <- ggplot(data = nl_st, aes(fill = Exposure)) + 
+  geom_sf(lwd=0.0001, colour = 'white') + theme_fivethirtyeight() + guides(fill = guide_colorbar(barwidth = 16, barheight = 3)) + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+  scale_fill_scico(palette = map_name, limits = c(min_val, max_val), na.value=na_colour) +
+  labs(title = "Exposure", subtitle = "PC4 level - NAs in red")
+
+plot_res_pc3 <- ggplot(data = nl_st_pc3, aes(fill = exposure)) + 
+  geom_sf(lwd=0.0001, colour = 'white') + theme_fivethirtyeight() + guides(fill = guide_colorbar(barwidth = 16, barheight = 3)) + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+  scale_fill_scico(palette = map_name, limits = c(min_val, max_val)) +
+  labs(title = "Exposure", subtitle = "PC3 level")
+
+plot_res_pc2 <- ggplot(data = nl_st_pc2, aes(fill = exposure)) + 
+  geom_sf(lwd=0.0001, colour = 'white') + theme_fivethirtyeight() + guides(fill = guide_colorbar(barwidth = 16, barheight = 3)) + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+  scale_fill_scico(palette = map_name, limits = c(min_val, max_val)) +
+  labs(title = "Exposure", subtitle = "PC2 level")
+
+plot_grid(plot_res_pc4, plot_res_pc3, plot_res_pc2, ncol=3)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Smoothing the residuals at the PC3 level
+
+
+```{r, fig.height = 20, fig.width = 14, warning=FALSE, error=FALSE, message=FALSE}
+# you can change the fig.width=16 by out.width = '90%' while compiling to html 
+
+# define the colour of the NA on the map, I chose Monza red
+na_colour = '#cf000f' 
+
+###########################################################
+# Load the shapefile provided by Allsecur                 #
+# if necessary it can be updated using the free resource: #
+# http://geoplaza.vu.nl/data/dataset/postcode             #
+###########################################################
+nl_shp = rgdal::readOGR('D:/Users/EUDZ040/R/005_zoning_allsecur/Zoning-git/Shape/Nlp4_r14.shp')
+# Re-load in different format, much more easier to plot then
+nl_st = sf::st_read('D:/Users/EUDZ040/R/005_zoning_allsecur/Zoning-git/Shape/Nlp4_r14.shp')
+
+# Convert the coordinates
+nl_shp@data$XCOORD = nl_shp@data$XCOORD/10000
+nl_shp@data$YCOORD = nl_shp@data$YCOORD/10000
+nl_st$XCOORD = nl_st$XCOORD/10000
+nl_st$YCOORD = nl_st$YCOORD/10000
+
+# Merge polygons by ID
+nl_st_pc3  = group_by(nl_st, PC3CODE) %>% summarize(do_union = TRUE)
+nl_shp_pc3 = as(nl_st_pc3, "Spatial")
+
+nl_st_pc2  = group_by(nl_st, PC2CODE) %>% summarize(do_union = TRUE)
+nl_shp_pc2 = as(nl_st_pc2, "Spatial")
+
+
+# shp <- shapefile("D:/Users/EUDZ040/R/005_zoning_allsecur/Alessandra_files/Nlp4_r14.shp")
+
+#######################################
+# Load the data about the Emblem GLM  #
+# The .py is maintained by Alessadra  #
+# @ 18/01/2019 (csv write)            #
+#######################################
+res_train = copy(res_tr) #fread('D:/Users/EUDZ040/R/005_zoning_allsecur/Alessandra_files/res_training_set.csv')
+
+#################
+#   Data prep   #
+#################
+
+# Drop the unnecessary columns
+# res_train = res_train[, -c('V1', "freq_all")]
+# 
+# # Rename pedestrian way but more readable
+# old_names = c("freq_all_exp")
+# new_names = c("glm_ncl")
+# setnames(res_train, old = old_names, new = new_names)
+# 
+# # Compute the freq, geometric and arithmetic residuals
+# res_train[, `:=`(obs_freq = ncl_tpl/Exposure, glm_freq = glm_ncl/Exposure)][,std_freq:=sqrt(obs_freq/Exposure)]
+
+# Some observed frequencies are artificially large (low exposure) since the observed freq is computed on very few observations.
+# I cap the residuals to the 2.5 and 97.5 percentile values to avoid too large values
+# This capping should be imporved
+res_train[, `:=`(obs_freq_raw = obs_freq)][, `:=`(obs_freq = squish(obs_freq, quantile(obs_freq, c(.025, .975), na.rm = T) ))]
+
+res_train[,`:=`(
+  geom_res_freq = (obs_freq / glm_freq),
+  arithm_res_freq = (obs_freq - glm_freq), 
+  geom_res_ncl =  (ncl_tpl / glm_ncl),
+  arithm_res_ncl =  (ncl_tpl - glm_ncl),
+  PC3CODE = substr(as.character(PC4CODE), 1, 3),
+  PC2CODE = substr(as.character(PC4CODE), 1, 2) 
+  )]
+
+# Store them as categorical variable
+res_train[, `:=`(PC4CODE = as.factor(PC4CODE), PC3CODE = as.factor(PC3CODE), PC2CODE = as.factor(PC2CODE) )]
+
+# Compute the aggregated GLM residuals by PC3 and PC2, doing the way I did below preserve the number of rows (meaning res @PC2 and PC3 
+# are duplicated)
+res_train_pc3 = res_train[, .(exposure = sum(Exposure, na.rm = T), 
+                          ncl_tpl = sum(ncl_tpl, na.rm = T),
+                          glm_ncl = sum(glm_ncl, na.rm = T)), by = PC3CODE]
+res_train_pc3[, geom_res_freq := ncl_tpl/glm_ncl]
+
+res_train_pc2 = res_train[, .(exposure = sum(Exposure, na.rm = T), 
+                          ncl_tpl = sum(ncl_tpl, na.rm = T),
+                          glm_ncl = sum(glm_ncl, na.rm = T)), by = PC2CODE]
+res_train_pc2[, geom_res_freq := ncl_tpl/glm_ncl]
+
+# Store the Geom res scale and scale to [0,1] for a beta regression (Gamma not allowed since some residuals = 0)
+max_geom_freq_pc2 = max(res_train_pc2$geom_res_freq, na.rm = T)
+res_train_pc2[, geom_res_freq := geom_res_freq/max_geom_freq_pc2]
+
+max_geom_freq_pc3 = max(res_train_pc3$geom_res_freq, na.rm = T)
+res_train_pc3[, geom_res_freq := geom_res_freq/max_geom_freq_pc3]
+
+# Extract the data from the shapefile
+states_df_pc3 <- nl_shp_pc3 %>%   
+  as.data.table() %>% 
+  droplevels()
+
+states_df_pc2 <- nl_shp_pc2 %>%   
+  as.data.table() %>% 
+  droplevels()
+
+# Left outer join, keep all records from the states_df (see the following tutorial if your are not used to mighty data.table https://rstudio-pubs-static.s3.amazonaws.com/52230_5ae0d25125b544caab32f75f0360e775.html)
+states_df_pc3 = res_train_pc3[states_df_pc3, on = c(PC3CODE = "PC3CODE")]
+states_df_pc2 = res_train_pc2[states_df_pc2, on = c(PC2CODE = "PC2CODE")]
+
+# Drop the NA in the n_cl, otherwise the GMRF will not work!
+states_df_pc3 = states_df_pc3[!is.na(states_df_pc3$ncl_tpl), ]
+
+# List all the remaining zipcodes
+zc_pc3 = unique(states_df_pc3$PC3CODE)
+
+#subset the shapefile
+shp_subset = subset(nl_shp_pc3, PC3CODE %in% zc_pc3)
+
+
+
+# use 6 parallel threads, reduce if fewer physical CPU cores
+ctrl <- gam.control(nthreads = 6) 
+
+######################################################################################################################################
+#                                                                                                                                    #
+# Fitting the GAM regression with GMRF as basis (discrete version of GP)                                                             #
+# Try to change the roughness param to see the effect                                                                                #
+#                                                                                                                                    #
+# roughness_param == should be an integer, the lower the smoother the plot (the rank of the MRF, the lower the rank the smoother)    #
+#                    if you remove k-param from the below fit, the fit will be done with full rand GMRF                              #
+######################################################################################################################################
+
+roughness_param = 100
+
+# Build the lattice for the GMRF (discrete version of the Gaussian Process)
+nb <- spdep::poly2nb(shp_subset, row.names = states_df_pc3$PC3CODE)
+names(nb) <- attr(nb, "region.id")
+
+gam_mrf_pc3 <- gam(geom_res_freq ~ s(PC3CODE, bs = 'mrf', k = roughness_param, xt = list(nb = nb)), # define MRF smooth
+               data = states_df_pc3,
+               method = 'REML',
+               family = betar,  # fit a beta regression
+               control = ctrl)
+
+
+
+
+# Drop the NA in the n_cl, otherwise the GMRF will not work!
+states_df_pc2 = states_df_pc2[!is.na(states_df_pc2$ncl_tpl), ]
+
+# List all the remaining zipcodes
+zc_pc2 = unique(states_df_pc2$PC2CODE)
+
+#subset the shapefile
+shp_subset = subset(nl_shp_pc2, PC2CODE %in% zc_pc2)
+
+# Build the lattice for the GMRF (discrete version of the Gaussian Process)
+nb <- spdep::poly2nb(shp_subset, row.names = states_df_pc2$PC2CODE)
+names(nb) <- attr(nb, "region.id")
+
+gam_mrf_pc2 <- gam(geom_res_freq ~ s(PC2CODE, bs = 'mrf', xt = list(nb = nb)), # define MRF smooth
+               data = states_df_pc2,
+               method = 'REML',
+               family = betar,  # fit a beta regression
+               control = ctrl)
+
+
+
+
+# Print out the summary
+summary(gam_mrf_pc3)
+
+# Add the prediction to the data.frame
+states_df_pc3 = states_df_pc3 %>%
+  mutate(fit_pc3 = predict(gam_mrf_pc3, type='response') * max_geom_freq_pc3, geom_res_freq_pc3 = geom_res_freq * max_geom_freq_pc3) %>% setDT
+
+states_df_pc2 = states_df_pc2 %>%
+  mutate(fit_pc2 = predict(gam_mrf_pc2, type='response') * max_geom_freq_pc2, geom_res_freq_pc2 = geom_res_freq * max_geom_freq_pc2) %>% setDT
+
+# Join the in sample prediction
+insample_pred_gmrf_pc3 = setDT( full_join( nl_st_pc3, states_df_pc3, by = c("PC3CODE" = "PC3CODE") ) )
+insample_pred_gmrf_pc2 = setDT( full_join( nl_st_pc2, states_df_pc2, by = c("PC2CODE" = "PC2CODE") ) )
+```
+
+
+
+
+
+
+
+```{r, fig.height = 20, fig.width = 14, warning=FALSE, error=FALSE, message=FALSE}
+
+####################
+# Plot the results #
+####################
+
+max_obs = max(insample_pred_gmrf_pc3$geom_res_freq_pc3, na.rm = T)
+max_fit = max(insample_pred_gmrf_pc3$fit_pc3, na.rm = T)
+
+# the common scale
+max_val = max(max_obs, max_fit)
+min_val = 0 #min(insample_pred_gmrf$fit_pc3, na.rm = T)
+
+plot_insample_pred_pc3 <- ggplot(data = insample_pred_gmrf_pc3, aes(fill = fit_pc3)) + 
+  geom_sf(lwd=0.0001, colour = 'white') + theme_fivethirtyeight() + guides(fill = guide_colorbar(barwidth = 16, barheight = 3)) + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+  scale_fill_gradientn(colours = pals::ocean.delta(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) +
+  labs(title = "Smoothed geometric residuals", subtitle = "PC3 level")
+
+plot_insample_true_pc3 <- ggplot(data = insample_pred_gmrf_pc3, aes(fill = geom_res_freq_pc3)) + 
+  geom_sf(lwd=0.0001, colour = 'white') + theme_fivethirtyeight() + guides(fill = guide_colorbar(barwidth = 16, barheight = 3)) + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+  scale_fill_gradientn(colours = pals::ocean.delta(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) + 
+  labs(title = "Raw geometric residuals", subtitle = "PC3 level")
+
+
+
+
+max_obs = max(insample_pred_gmrf_pc2$geom_res_freq_pc2, na.rm = T)
+max_fit = max(insample_pred_gmrf_pc2$fit_pc2, na.rm = T)
+
+# the common scale
+max_val = max(max_obs, max_fit)
+min_val = 0 #min(insample_pred_gmrf$fit_pc3, na.rm = T)
+
+plot_insample_pred_pc2 <- ggplot(data = insample_pred_gmrf_pc2, aes(fill = fit_pc2)) + 
+  geom_sf(lwd=0.0001, colour = 'white') + theme_fivethirtyeight() + guides(fill = guide_colorbar(barwidth = 16, barheight = 3)) + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+  scale_fill_gradientn(colours = pals::ocean.delta(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) +
+  labs(title = "Smoothed geometric residuals", subtitle = "PC2 level")
+
+plot_insample_true_pc2 <- ggplot(data = insample_pred_gmrf_pc2, aes(fill = geom_res_freq_pc2)) + 
+  geom_sf(lwd=0.0001, colour = 'white') + theme_fivethirtyeight() + guides(fill = guide_colorbar(barwidth = 16, barheight = 3)) + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+  scale_fill_gradientn(colours = pals::ocean.delta(100), 
+                         values = rescale(c(min_val, 1, max_val)),
+                         guide = "colorbar", limits=c(min_val, max_val), oob=squish, na.value=na_colour) + 
+  labs(title = "Raw geometric residuals", subtitle = "PC2 level")
+
+
+
+
+plot_grid(plot_insample_true_pc3, plot_insample_pred_pc3,
+          plot_insample_true_pc2, plot_insample_pred_pc2,
+          ncol=2)
+```
+
+
+
+## Hierarchical clustering of the smoothed residuals
+
+```{r}
+res_res_dt = insample_pred_gmrf_pc3[, .(PC3CODE, geom_res_freq_pc3, fit_pc3)][, res_res := geom_res_freq_pc3 - fit_pc3]
+
+# Clustering works best with scaled variables
+res_res_dt[, res_res_sc := scale(res_res)]
+
+# note there are some NA in the input
+na_dt = res_res_dt[is.na(res_res_sc)]
+
+# let's remove them
+res_res_dt = res_res_dt[!is.na(res_res_sc)]
+
+# Dissimilarity matrix
+#d <- dist(res_res_dt$res_res_sc, method = "euclidean")
+d <- dist(res_res_dt$fit_pc3, method = "euclidean")
+
+# Hierarchical clustering using Ward's method
+res.hc <- hclust(d, method = "ward.D2" )
+
+# Cut tree into n groups
+n_zone30 = 30
+grp30 <- cutree(res.hc, k = n_zone30)
+
+# Cut tree into n groups
+n_zone20 = 20
+grp20 <- cutree(res.hc, k = n_zone20)
+
+# Cut tree into n groups
+n_zone10 = 10
+grp10 <- cutree(res.hc, k = n_zone10)
+```
+
+# export the zones
+fwrite(zones_gmrf[, .(PC4CODE, PC3CODE, PC2CODE, PC1CODE, zone30, zone20, zone10)], "PC4zones_gamgmrf.csv")
+
+```{r, results='asis'}
+# Number of members in each cluster
+pander( table(grp30) )
+```
+
+
+```{r, results='asis'}
+# Number of members in each cluster
+pander( table(grp20) )
+```
+
+Probably too many zones.
+
+```{r, results='asis'}
+# Number of members in each cluster
+pander( table(grp10) )
+```
+
+```{r}
+# Clustering works best with scaled variables
+res_res_dt[, `:=`(zone30 = as.factor(grp30), zone20 = as.factor(grp20), zone10 = as.factor(grp10))]
+
+# joining to the shapefile
+zones_gmrf = setDT( full_join(nl_st_pc3, res_res_dt, by = c("PC3CODE" = "PC3CODE") ) )
+
+# export the zones
+fwrite(zones_gmrf[, .(PC3CODE, zone30, zone20, zone10)], "PC3zones_gamgmrf.csv")
+```
+
+
+The zones in **qualitative colours**
+
+```{r, fig.height = 11, fig.width = 16, warning=FALSE, error=FALSE, message=FALSE}
+# Plot the results
+plot_gmrf_zones20 <- ggplot(data = zones_gmrf, aes(fill = zone20)) + 
+  geom_sf(lwd=0.0001, colour = 'white') + theme_fivethirtyeight()  + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+    scale_fill_manual(values = col20, breaks = seq.int(1,n_zone20), na.value=na_colour) +
+    labs(title = "GMRF at PC3 level - 20 zones", subtitle = "Cut of the hierarchical dendrogram") +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE))
+
+
+plot_gmrf_zones10 <- ggplot(data = zones_gmrf, aes(fill = zone10)) + 
+  geom_sf(lwd=0.0001, colour = 'white') + theme_fivethirtyeight()  + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+    scale_fill_manual(values = col10, breaks = seq.int(1,n_zone10), na.value=na_colour ) + 
+    labs(title = "GMRF at PC3 level - 10 zones", subtitle = "Cut of the hierarchical dendrogram") + 
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE))
+
+# plot the grid
+plot_grid(plot_gmrf_zones20, plot_gmrf_zones10) 
+```
+
+
+
+
+The zones in **sequential colours**
+
+```{r, fig.height = 11, fig.width = 16, warning=FALSE, error=FALSE, message=FALSE}
+# Plot the results
+plot_gmrf_zones20 <- ggplot(data = zones_gmrf, aes(fill = zone20)) + 
+  geom_sf(lwd=0.0001, colour = 'white') + theme_fivethirtyeight()  + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+    scale_fill_manual(values = pals::ocean.haline(length(col20)), breaks = seq.int(1,n_zone20), na.value=na_colour) +
+    labs(title = "GMRF at PC3 level - 20 zones", subtitle = "Cut of the hierarchical dendrogram") +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE))
+
+
+plot_gmrf_zones10 <- ggplot(data = zones_gmrf, aes(fill = zone10)) + 
+  geom_sf(lwd=0.0001, colour = 'white') + theme_fivethirtyeight()  + 
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+    scale_fill_manual(values = pals::ocean.haline(length(col10)), breaks = seq.int(1,n_zone10), na.value=na_colour ) + 
+    labs(title = "GMRF at PC3 level - 10 zones", subtitle = "Cut of the hierarchical dendrogram") + 
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE))
+
+# plot the grid
+plot_grid(plot_gmrf_zones20, plot_gmrf_zones10) 
+```
+
+
+
+
+
+
+
+
+
+
+
+
